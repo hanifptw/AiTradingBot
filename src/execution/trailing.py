@@ -15,11 +15,17 @@ from src.core import repository as repo
 from src.core.db import session
 from src.market.binance_client import get_binance
 from src.strategy.risk import trailing_sl_price
+from src.tgbot.notifier import notify
 
 log = logging.getLogger(__name__)
 
 # Minimum % improvement before we bother re-placing the stop. Keeps API noise down.
 _MIN_BUMP_PCT = Decimal("0.1")
+
+
+def _valid_order_id(oid: str | None) -> bool:
+    """Return True only for a real, non-placeholder order ID."""
+    return bool(oid) and oid not in ("None", "0")
 
 
 async def run_trailing_tick() -> None:
@@ -46,16 +52,21 @@ async def run_trailing_tick() -> None:
             bump = abs(desired - current) / current * Decimal("100") if current > 0 else Decimal("999")
             if bump < _MIN_BUMP_PCT:
                 continue
-            if pos.sl_order_id:
+            if _valid_order_id(pos.sl_order_id):
                 await binance.cancel_order(pos.symbol, pos.sl_order_id)
             sl_side = "SELL" if pos.side == "LONG" else "BUY"
             resp = await binance.stop_market_reduce_only(pos.symbol, sl_side, desired)
+            new_order_id = str(oid) if (oid := resp.get("orderId")) else None
             async with session() as s:
                 pos2 = await repo.open_position_for(s, pos.symbol)
                 if pos2 is not None:
                     pos2.sl_price = desired
-                    pos2.sl_order_id = str(resp.get("orderId")) if resp else None
+                    pos2.sl_order_id = new_order_id
                     await s.commit()
             log.info("Trailed SL %s: %s -> %s (price=%s)", pos.symbol, current, desired, price)
-        except Exception:
-            log.exception("Trailing update failed for %s", pos.symbol)
+            await notify(
+                f"📍 Trailing SL *{pos.symbol}* {pos.side}\n"
+                f"SL: `{current}` → `{desired}` (mark=`{price:.4f}`)"
+            )
+        except Exception as exc:
+            log.exception("Trailing update failed for %s: %s", pos.symbol, exc)

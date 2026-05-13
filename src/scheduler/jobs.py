@@ -18,7 +18,7 @@ from decimal import Decimal
 from src.ai.evaluator import generate_report
 from src.core import repository as repo
 from src.core.db import session
-from src.execution.trailing import run_trailing_tick
+from src.execution.trailing import _valid_order_id, run_trailing_tick
 from src.indicators.stochastic import StochParams
 from src.market.binance_client import get_binance
 from src.market.universe import fetch_top_universe
@@ -154,10 +154,10 @@ async def sync_positions() -> None:
             if pos2 is None:
                 continue  # Already closed by another path
             # Cancel the order that didn't fire (Binance may auto-cancel, but be explicit).
-            if reason == "TP" and pos2.sl_order_id:
+            if reason == "TP" and _valid_order_id(pos2.sl_order_id):
                 with contextlib.suppress(Exception):
                     await binance.cancel_order(pos.symbol, pos2.sl_order_id)
-            elif reason == "SL" and pos2.tp_order_id:
+            elif reason == "SL" and _valid_order_id(pos2.tp_order_id):
                 with contextlib.suppress(Exception):
                     await binance.cancel_order(pos.symbol, pos2.tp_order_id)
             await repo.close_position(

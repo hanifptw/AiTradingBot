@@ -114,9 +114,9 @@ async def _handle_entry(ev: EntrySignal) -> None:
             entry_price=fill_price,
             leverage=settings.leverage,
             sl_price=sl_quant,
-            sl_order_id=str(sl_resp.get("orderId")) if sl_resp else None,
+            sl_order_id=(str(oid) if (oid := sl_resp.get("orderId")) else None),
             tp_price=tp_quant,
-            tp_order_id=str(tp_resp.get("orderId")) if tp_resp else None,
+            tp_order_id=(str(oid) if (oid := tp_resp.get("orderId")) else None),
         )
         pos = await repo.create_position(s, pos)
 
