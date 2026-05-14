@@ -8,6 +8,7 @@ Views:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from decimal import Decimal, InvalidOperation
 
@@ -19,6 +20,7 @@ from telegram.ext import ContextTypes
 from src.core import repository as repo
 from src.core.db import session
 from src.core.models import Settings
+from src.execution.trailing import run_trailing_tick
 from src.tgbot.auth import restricted
 
 ALLOWED_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"]
@@ -189,7 +191,10 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
             if arg1 == "autotrade":
                 await repo.update_setting(s, autotrade_enabled=not cfg.autotrade_enabled)
             elif arg1 == "trailing":
-                await repo.update_setting(s, trailing_enabled=not cfg.trailing_enabled)
+                new_trailing = not cfg.trailing_enabled
+                await repo.update_setting(s, trailing_enabled=new_trailing)
+                if new_trailing:
+                    asyncio.create_task(run_trailing_tick())
 
         elif action == "tf":
             if arg1 in ALLOWED_TIMEFRAMES:

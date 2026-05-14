@@ -141,13 +141,18 @@ async def sync_positions() -> None:
         direction = Decimal("1") if pos.side == "LONG" else Decimal("-1")
         pnl = pos.qty * (exit_price - pos.entry_price) * direction
 
-        # Determine close reason: compare exit price to TP price if available.
+        # Determine close reason by comparing exit price to TP and SL levels.
         reason = "SL"
         if pos.tp_price and (
             (pos.side == "LONG" and exit_price >= pos.tp_price * Decimal("0.995"))
             or (pos.side == "SHORT" and exit_price <= pos.tp_price * Decimal("1.005"))
         ):
             reason = "TP"
+        elif pos.sl_price and pos.sl_price > 0:
+            # Exit more than 2% away from SL level → not an SL fill → manual close.
+            near_sl = abs(exit_price - pos.sl_price) / pos.sl_price <= Decimal("0.02")
+            if not near_sl:
+                reason = "MANUAL"
 
         async with session() as s:
             pos2 = await repo.open_position_for(s, pos.symbol)
@@ -157,9 +162,12 @@ async def sync_positions() -> None:
             if reason == "TP" and _valid_order_id(pos2.sl_order_id):
                 with contextlib.suppress(Exception):
                     await binance.cancel_order(pos.symbol, pos2.sl_order_id)
-            elif reason == "SL" and _valid_order_id(pos2.tp_order_id):
+            elif reason in ("SL", "MANUAL") and _valid_order_id(pos2.tp_order_id):
                 with contextlib.suppress(Exception):
                     await binance.cancel_order(pos.symbol, pos2.tp_order_id)
+            if reason in ("SL", "MANUAL") and _valid_order_id(pos2.sl_order_id):
+                with contextlib.suppress(Exception):
+                    await binance.cancel_order(pos.symbol, pos2.sl_order_id)
             await repo.close_position(
                 s, pos2,
                 exit_price=exit_price,
@@ -169,8 +177,8 @@ async def sync_positions() -> None:
             )
 
         sign = "+" if pnl >= 0 else ""
-        emoji = "🎯" if reason == "TP" else "🛑"
-        label = "kena TP" if reason == "TP" else "kena SL"
+        emoji = "🎯" if reason == "TP" else ("✋" if reason == "MANUAL" else "🛑")
+        label = "kena TP" if reason == "TP" else ("ditutup manual" if reason == "MANUAL" else "kena SL")
         await notify(
             f"{emoji} *{pos.side} {pos.symbol}* {label}\n"
             f"Entry: `{pos.entry_price:.4f}` → Exit: `{exit_price:.4f}`\n"

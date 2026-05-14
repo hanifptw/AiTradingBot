@@ -124,8 +124,16 @@ def fmt_positions(
     return "\n".join(lines)
 
 
-def fmt_pnl_windows(stats: dict[str, tuple[Decimal, int, int]]) -> str:
+def fmt_pnl_windows(
+    stats: dict[str, tuple[Decimal, int, int]],
+    upnl: Decimal | None = None,
+    open_count: int = 0,
+) -> str:
     lines = ["*PNL*"]
+    if upnl is not None:
+        sign = "+" if upnl >= 0 else ""
+        lines.append(f"• Unrealized: `{sign}{upnl:.2f}` USDT  ({open_count} posisi terbuka)")
+        lines.append("")
     for label, (pnl, wins, total) in stats.items():
         wr = f"{(wins / total * 100):.1f}%" if total else "—"
         lines.append(f"• {label}: `{pnl:+.2f}` USDT  ({wins}/{total}, WR {wr})")
