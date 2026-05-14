@@ -31,6 +31,7 @@ class CloseReason(str, Enum):
     SL = "SL"
     MANUAL = "MANUAL"
     LIQUIDATED = "LIQUIDATED"
+    AI_EARLY_EXIT = "AI_EARLY_EXIT"
 
 
 class Base(DeclarativeBase):
@@ -61,6 +62,10 @@ class Settings(Base):
     tp_pct: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=Decimal("3.0"))
     mode: Mapped[str] = mapped_column(String, default="testnet")
     autotrade_enabled: Mapped[bool] = mapped_column(default=False)
+
+    ai_entry_filter_enabled: Mapped[bool] = mapped_column(default=True)
+    ai_early_exit_enabled: Mapped[bool] = mapped_column(default=True)
+    ai_min_confidence: Mapped[int] = mapped_column(Integer, default=60)
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.utcnow()
@@ -172,6 +177,26 @@ class AIReport(Base):
     model: Mapped[str] = mapped_column(String)
     trades_count: Mapped[int] = mapped_column(Integer)
     report_md: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.utcnow()
+    )
+
+
+class AIDecision(Base):
+    """Audit log for AI entry-filter and early-exit decisions."""
+
+    __tablename__ = "ai_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    decision_type: Mapped[str] = mapped_column(String, index=True)  # 'ENTRY' | 'EARLY_EXIT'
+    symbol: Mapped[str] = mapped_column(String, index=True)
+    side: Mapped[str] = mapped_column(String)
+    action: Mapped[str] = mapped_column(String)  # APPROVE / REJECT / EXIT / HOLD
+    confidence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    model: Mapped[str] = mapped_column(String)
+    raw_response: Mapped[str | None] = mapped_column(String, nullable=True)
+    position_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.utcnow()
     )

@@ -47,7 +47,8 @@ BINANCE_API_SECRET=...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_ALLOWED_USER_IDS=12345,67890
 OPENROUTER_API_KEY=...
-OPENROUTER_MODEL=anthropic/claude-sonnet-4.5
+OPENROUTER_MODEL=anthropic/claude-sonnet-4.5            # weekly evaluator (deep)
+OPENROUTER_DECISION_MODEL=anthropic/claude-haiku-4.5    # entry filter + early exit (cheap+fast)
 COINGECKO_API_KEY=                   # optional, free tier works
 DB_PATH=./data/bot.db
 LOG_LEVEL=INFO
@@ -108,6 +109,9 @@ Inline keyboard: **Saldo · Posisi · PNL · Monitor Coin · Setting · AI Analy
 - Equity % per trade
 - Max concurrent positions (default 5)
 - Stochastic params (K, D, smooth)
+- AI Entry Filter toggle (default ON) — AI pre-trade gate
+- AI Early Exit toggle (default ON) — AI bar-close exit monitor
+- AI min confidence (default 60) — reject entry if AI confidence below this
 - MODE (testnet / live)
 
 Auth: only `TELEGRAM_ALLOWED_USER_IDS` accepted; all other updates dropped silently.
@@ -122,17 +126,29 @@ Important: **autotrade is OFF by default** (`settings.autotrade_enabled`). The b
 
 ## AI Evaluation
 
-`ai/evaluator.py` builds a structured summary (last N closed trades, win rate, avg R, current settings) and sends it to OpenRouter. The prompt asks for: (1) pattern detection in losing trades, (2) parameter tuning suggestions, (3) discipline/risk observations. Reports stored in `ai_reports`. Triggered on-demand from Telegram and via a weekly APScheduler cron.
+`ai/evaluator.py` builds a structured summary (last N closed trades, win rate, avg R, current settings) and sends it to OpenRouter (model = `OPENROUTER_MODEL`, default Sonnet 4.5). The prompt asks for: (1) pattern detection in losing trades, (2) parameter tuning suggestions, (3) discipline/risk observations. Reports stored in `ai_reports`. Triggered on-demand from Telegram and via a weekly APScheduler cron.
+
+## AI Decision Layer (Entry Filter + Early Exit)
+
+Two real-time AI gates wrap the Stochastic strategy. Both call `OPENROUTER_DECISION_MODEL` (default `anthropic/claude-haiku-4.5` — cheap, fast, enough reasoning for TA multi-faktor). Sonnet 4.5 stays reserved for the weekly evaluator.
+
+- **Entry filter** (`ai/decision.py::confirm_entry`) — on every `EntrySignal`, before `set_leverage` in `execution/executor.py::_handle_entry`. AI evaluates market structure (HH/HL vs LH/LL), momentum alignment, supply/demand proximity to entry, and R:R viability. Returns JSON `{approve, confidence, reason, concerns}`. Rejected if `approve=false` OR `confidence < settings.ai_min_confidence`. Rejections logged to `ai_decisions` + Telegram notify.
+- **Early exit** (`ai/decision.py::should_exit_early`) — runs inside the kline poll job (`scheduler/jobs.py::_process`), once per bar close per symbol that has an open position. Reuses the kline DataFrame already fetched — **no extra Binance HTTP**. AI looks for (a) trend reversal against position, (b) decent profit + reversal forming. Returns JSON `{exit, confidence, reason}`. If `exit=true`, publishes `ExitSignal(reason="AI_EARLY_EXIT")` which `_handle_exit` consumes like any other exit.
+
+Fail-safe: any LLM/parse error → entry rejected, exit held.
+
+All AI decisions persist to `ai_decisions` (decision_type, action, confidence, reason, model, raw_response, position_id) for audit. The two settings toggles `ai_entry_filter_enabled` / `ai_early_exit_enabled` default ON; flip from the Telegram Setting menu.
 
 ## Database (SQLite via SQLAlchemy)
 
-- `settings` (singleton) — runtime config controlled by Telegram
+- `settings` (singleton) — runtime config controlled by Telegram (incl. AI toggles)
 - `monitored_symbols` — current top 20, cached market-cap rank
 - `signal_states` — per-symbol state machine snapshot
 - `positions` — open + closed positions
 - `orders` — raw Binance order log
 - `trades` — closed-trade summary (entry, exit, PnL, R-multiple, mode tag)
-- `ai_reports` — AI evaluation history with timestamp + model used
+- `ai_reports` — weekly/on-demand AI evaluation history (markdown, model used)
+- `ai_decisions` — per-call audit log for entry filter + early-exit decisions
 
 ## Conventions
 

@@ -30,6 +30,7 @@ class AppConfig(BaseSettings):
 
     openrouter_api_key: str = ""
     openrouter_model: str = "anthropic/claude-sonnet-4.5"
+    openrouter_decision_model: str = "anthropic/claude-haiku-4.5"
 
     coingecko_api_key: str = ""
 

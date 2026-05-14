@@ -7,6 +7,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.models import (
+    AIDecision,
     AIReport,
     MonitoredSymbol,
     Order,
@@ -244,3 +245,19 @@ async def save_ai_report(s: AsyncSession, report: AIReport) -> AIReport:
 async def last_ai_report(s: AsyncSession) -> AIReport | None:
     res = await s.execute(select(AIReport).order_by(AIReport.created_at.desc()).limit(1))
     return res.scalars().first()
+
+
+# --- AI decisions (entry filter + early exit audit) -------------------------
+
+async def add_ai_decision(s: AsyncSession, decision: AIDecision) -> AIDecision:
+    s.add(decision)
+    await s.commit()
+    await s.refresh(decision)
+    return decision
+
+
+async def recent_ai_decisions(s: AsyncSession, limit: int = 20) -> list[AIDecision]:
+    res = await s.execute(
+        select(AIDecision).order_by(AIDecision.created_at.desc()).limit(limit)
+    )
+    return list(res.scalars().all())

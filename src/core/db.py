@@ -37,6 +37,9 @@ async def _migrate(engine: AsyncEngine) -> None:
         "ALTER TABLE positions ADD COLUMN tp_order_id VARCHAR",
         "ALTER TABLE settings ADD COLUMN trade_amount NUMERIC(18,4) DEFAULT 100.0 NOT NULL",
         "ALTER TABLE settings ADD COLUMN trailing_trigger_pct NUMERIC(10,4) DEFAULT 1.0 NOT NULL",
+        "ALTER TABLE settings ADD COLUMN ai_entry_filter_enabled BOOLEAN DEFAULT 1 NOT NULL",
+        "ALTER TABLE settings ADD COLUMN ai_early_exit_enabled BOOLEAN DEFAULT 1 NOT NULL",
+        "ALTER TABLE settings ADD COLUMN ai_min_confidence INTEGER DEFAULT 60 NOT NULL",
     ]
     async with engine.begin() as conn:
         for sql in migrations:

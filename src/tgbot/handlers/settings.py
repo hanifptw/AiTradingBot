@@ -51,8 +51,16 @@ def settings_keyboard(s: Settings) -> InlineKeyboardMarkup:
     minus_step, plus_step = _adj("trailing_offset_pct", "0.1")
     minus_mp, plus_mp = _adj("max_positions", "1")
 
+    minus_conf, plus_conf = _adj("ai_min_confidence", "5")
+
     autotrade_label = "🟢 Autotrade: ON" if s.autotrade_enabled else "🔴 Autotrade: OFF"
     trailing_label = "📈 Trailing: ON" if s.trailing_enabled else "📈 Trailing: OFF"
+    ai_entry_label = (
+        "🤖 AI Entry Filter: ON" if s.ai_entry_filter_enabled else "🤖 AI Entry Filter: OFF"
+    )
+    ai_exit_label = (
+        "🤖 AI Early Exit: ON" if s.ai_early_exit_enabled else "🤖 AI Early Exit: OFF"
+    )
 
     return InlineKeyboardMarkup([
         [_b(autotrade_label, "set:toggle:autotrade")],
@@ -65,6 +73,9 @@ def settings_keyboard(s: Settings) -> InlineKeyboardMarkup:
         [_noop("🎯 Trail trigger"), minus_trig, _noop(f"{s.trailing_trigger_pct:.1f}%"), plus_trig],
         [_noop("📏 Trail step"),    minus_step, _noop(f"{s.trailing_offset_pct:.1f}%"),  plus_step],
         [_noop("👥 Max pos"),     minus_mp,  _noop(str(s.max_positions)),       plus_mp],
+        [_b(ai_entry_label, "set:toggle:ai_entry")],
+        [_b(ai_exit_label,  "set:toggle:ai_exit")],
+        [_noop("🎚 AI min conf"), minus_conf, _noop(f"{s.ai_min_confidence}%"),  plus_conf],
         [_b(f"🔬 Stochastic  K={s.stoch_k}  D={s.stoch_d}  sm={s.stoch_smooth}",
             "set:menu:stoch")],
         [_b("← Menu", "menu:main")],
@@ -101,6 +112,9 @@ def _settings_text(s: Settings) -> str:
         f"• Trailing: `{'ON' if s.trailing_enabled else 'OFF'}` "
         f"(trigger `{s.trailing_trigger_pct:.1f}%`, step `{s.trailing_offset_pct:.1f}%`)\n"
         f"• Max positions: `{s.max_positions}`\n"
+        f"• AI Entry: `{'ON' if s.ai_entry_filter_enabled else 'OFF'}` | "
+        f"AI Exit: `{'ON' if s.ai_early_exit_enabled else 'OFF'}` | "
+        f"min conf: `{s.ai_min_confidence}%`\n"
         f"• Stoch: K=`{s.stoch_k}` D=`{s.stoch_d}` smooth=`{s.stoch_smooth}`"
     )
 
@@ -197,6 +211,14 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
                 await repo.update_setting(s, trailing_enabled=new_trailing)
                 if new_trailing:
                     asyncio.create_task(run_trailing_tick())
+            elif arg1 == "ai_entry":
+                await repo.update_setting(
+                    s, ai_entry_filter_enabled=not cfg.ai_entry_filter_enabled,
+                )
+            elif arg1 == "ai_exit":
+                await repo.update_setting(
+                    s, ai_early_exit_enabled=not cfg.ai_early_exit_enabled,
+                )
 
         elif action == "tf":
             if arg1 in ALLOWED_TIMEFRAMES:
@@ -209,10 +231,11 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
             except InvalidOperation:
                 return
 
-            if field in {"leverage", "max_positions", "stoch_k", "stoch_d", "stoch_smooth"}:
+            if field in {"leverage", "max_positions", "stoch_k", "stoch_d", "stoch_smooth", "ai_min_confidence"}:
                 current = int(getattr(cfg, field))
-                new_val = max(1, current + int(delta))
-                caps = {"leverage": 125, "max_positions": 20}
+                floor = 0 if field == "ai_min_confidence" else 1
+                new_val = max(floor, current + int(delta))
+                caps = {"leverage": 125, "max_positions": 20, "ai_min_confidence": 100}
                 new_val = min(caps.get(field, 9999), new_val)
                 await repo.update_setting(s, **{field: new_val})
 

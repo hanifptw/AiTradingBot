@@ -9,10 +9,12 @@ from __future__ import annotations
 import logging
 from decimal import Decimal
 
+from src.ai.decision import confirm_entry
 from src.core import repository as repo
 from src.core.db import session
 from src.core.events import EntrySignal, ExitSignal, get_bus
 from src.core.models import Order, Position, Side
+from src.indicators.stochastic import StochParams
 from src.market.binance_client import get_binance
 from src.strategy.risk import position_size, sl_price, tp_price
 from src.tgbot.notifier import notify
@@ -87,6 +89,42 @@ async def _handle_entry(ev: EntrySignal) -> None:
         if qty <= 0:
             log.warning("Computed qty=0 for %s (sizing=%s) — skipping", ev.symbol, sizing)
             return
+
+        # AI pre-trade filter — reject if structure/momentum/SD/R:R look unfavorable.
+        if settings.ai_entry_filter_enabled:
+            sl_raw = sl_price(side=ev.side.value, entry=ev.price, sl_pct=settings.sl_pct)
+            tp_raw = tp_price(side=ev.side.value, entry=ev.price, tp_pct=settings.tp_pct)
+            df = await binance.klines(ev.symbol, settings.timeframe, limit=200)
+            df_closed = df.iloc[:-1] if not df.empty else df
+            decision = await confirm_entry(
+                symbol=ev.symbol,
+                side=ev.side,
+                entry_price=ev.price,
+                sl_price=sl_raw,
+                tp_price=tp_raw,
+                sl_pct=settings.sl_pct,
+                tp_pct=settings.tp_pct,
+                timeframe=settings.timeframe,
+                df=df_closed,
+                params=StochParams(
+                    k=settings.stoch_k, d=settings.stoch_d, smooth=settings.stoch_smooth,
+                ),
+                min_confidence=settings.ai_min_confidence,
+            )
+            if not decision.approve:
+                log.info(
+                    "AI rejected %s %s (conf=%d): %s",
+                    ev.side.value, ev.symbol, decision.confidence, decision.reason,
+                )
+                await notify(
+                    f"🤖 *AI skip {ev.side.value} {ev.symbol}* "
+                    f"(conf `{decision.confidence}%`)\n{decision.reason}"
+                )
+                return
+            log.info(
+                "AI approved %s %s (conf=%d): %s",
+                ev.side.value, ev.symbol, decision.confidence, decision.reason,
+            )
 
         await binance.set_leverage(ev.symbol, settings.leverage)
 

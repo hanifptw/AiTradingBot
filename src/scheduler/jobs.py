@@ -15,9 +15,11 @@ from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal
 
+from src.ai.decision import should_exit_early
 from src.ai.evaluator import generate_report
 from src.core import repository as repo
 from src.core.db import session
+from src.core.events import ExitSignal, get_bus
 from src.execution.trailing import _valid_order_id, run_trailing_tick
 from src.indicators.stochastic import StochParams
 from src.market.binance_client import get_binance
@@ -74,6 +76,35 @@ async def poll_klines_and_signal() -> None:
                     return
                 _last_bar_seen[sym] = latest_closed_ms
                 await process_symbol(sym, df_closed, params)
+
+                # AI early-exit check — runs once per bar close, only for symbols
+                # with an OPEN position. Reuses df_closed (no extra Binance call).
+                if not settings.ai_early_exit_enabled:
+                    return
+                async with session() as s2:
+                    pos = await repo.open_position_for(s2, sym)
+                if pos is None:
+                    return
+                last_close = Decimal(str(df_closed["close"].iloc[-1]))
+                decision = await should_exit_early(
+                    pos=pos,
+                    current_price=last_close,
+                    timeframe=settings.timeframe,
+                    df=df_closed,
+                    params=params,
+                )
+                if decision.exit:
+                    log.info(
+                        "AI early-exit %s %s (conf=%d): %s",
+                        pos.side, sym, decision.confidence, decision.reason,
+                    )
+                    await get_bus().publish(ExitSignal(
+                        symbol=sym, reason="AI_EARLY_EXIT", price=last_close,
+                    ))
+                    await notify(
+                        f"🤖 *AI early-exit {pos.side} {sym}* "
+                        f"(conf `{decision.confidence}%`)\n{decision.reason}"
+                    )
             except Exception:
                 log.exception("kline/signal failed for %s", sym)
 

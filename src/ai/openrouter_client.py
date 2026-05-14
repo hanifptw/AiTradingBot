@@ -9,13 +9,15 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
-async def chat(system: str, user: str, *, temperature: float = 0.3) -> str:
+async def chat(
+    system: str, user: str, *, temperature: float = 0.3, model: str | None = None
+) -> str:
     cfg = get_config()
     if not cfg.openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY not set")
 
     payload = {
-        "model": cfg.openrouter_model,
+        "model": model or cfg.openrouter_model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
