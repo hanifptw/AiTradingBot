@@ -1,9 +1,11 @@
-"""Periodic trailing-stop adjuster.
+"""Periodic trailing-stop adjuster (stepped/tiered).
 
-For each open position with trailing enabled, compute the desired SL based on
-the current mark price (LONG: max(current_sl, price*(1 - offset_pct))). If the
-new SL is materially better than the existing one, cancel the old stop order
-and place a fresh one.
+For each open position with trailing enabled:
+- Compute current unrealized profit %.
+- If profit < `trailing_trigger_pct`, leave SL untouched (initial sl_pct holds).
+- Else, snap SL to the highest milestone reached: M1 = breakeven, M2 = entry ±
+  step, M3 = entry ± 2·step, etc., where step = `trailing_offset_pct`.
+- Only update if the new SL is materially better than the current one.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from decimal import Decimal
 from src.core import repository as repo
 from src.core.db import session
 from src.market.binance_client import get_binance
-from src.strategy.risk import trailing_sl_price
+from src.strategy.risk import tiered_trailing_sl_price
 from src.tgbot.notifier import notify
 
 log = logging.getLogger(__name__)
@@ -39,10 +41,17 @@ async def run_trailing_tick() -> None:
     for pos in positions:
         try:
             price = await binance.mark_price(pos.symbol)
-            desired_raw = trailing_sl_price(
-                side=pos.side, current_price=price, offset_pct=settings.trailing_offset_pct
+            tier = tiered_trailing_sl_price(
+                side=pos.side,
+                current_price=price,
+                entry_price=pos.entry_price,
+                trigger_pct=settings.trailing_trigger_pct,
+                step_pct=settings.trailing_offset_pct,
             )
-            desired = binance.quantize_price(pos.symbol, desired_raw)
+            if tier is None:
+                continue  # profit below trigger — keep static SL
+
+            desired = binance.quantize_price(pos.symbol, tier.desired)
             current = pos.sl_price or Decimal("0")
             better = (
                 pos.side == "LONG" and desired > current
@@ -63,10 +72,20 @@ async def run_trailing_tick() -> None:
                     pos2.sl_price = desired
                     pos2.sl_order_id = new_order_id
                     await s.commit()
-            log.info("Trailed SL %s: %s -> %s (price=%s)", pos.symbol, current, desired, price)
+            log.info(
+                "Trailed SL %s M%d: %s -> %s (profit=%.2f%% offset=%s%%)",
+                pos.symbol, tier.milestone, current, desired,
+                float(tier.profit_pct), tier.sl_offset_pct,
+            )
+            sign = "+" if tier.profit_pct >= 0 else ""
+            level_label = "breakeven" if tier.sl_offset_pct == 0 else (
+                f"entry+{tier.sl_offset_pct}%" if pos.side == "LONG"
+                else f"entry−{tier.sl_offset_pct}%"
+            )
             await notify(
                 f"📍 Trailing SL *{pos.symbol}* {pos.side}\n"
-                f"SL: `{current}` → `{desired}` (mark=`{price:.4f}`)"
+                f"SL: `{current}` → `{desired}` (M{tier.milestone}, {level_label})\n"
+                f"Mark: `{price:.4f}` | Profit: `{sign}{tier.profit_pct:.2f}%`"
             )
         except Exception as exc:
             log.exception("Trailing update failed for %s: %s", pos.symbol, exc)

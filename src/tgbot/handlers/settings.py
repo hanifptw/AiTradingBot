@@ -47,7 +47,8 @@ def settings_keyboard(s: Settings) -> InlineKeyboardMarkup:
     minus_sl, plus_sl = _adj("sl_pct", "0.5")
     minus_tp, plus_tp = _adj("tp_pct", "0.5")
     minus_amt, plus_amt = _adj("trade_amount", "10")
-    minus_tr, plus_tr = _adj("trailing_offset_pct", "0.1")
+    minus_trig, plus_trig = _adj("trailing_trigger_pct", "0.1")
+    minus_step, plus_step = _adj("trailing_offset_pct", "0.1")
     minus_mp, plus_mp = _adj("max_positions", "1")
 
     autotrade_label = "🟢 Autotrade: ON" if s.autotrade_enabled else "🔴 Autotrade: OFF"
@@ -60,8 +61,9 @@ def settings_keyboard(s: Settings) -> InlineKeyboardMarkup:
         [_noop("🛡 SL %"),        minus_sl,  _noop(f"{s.sl_pct:.1f}%"),         plus_sl],
         [_noop("🎯 TP %"),        minus_tp,  _noop(f"{s.tp_pct:.1f}%"),         plus_tp],
         [_noop("💵 Amount USDT"), minus_amt, _noop(f"{s.trade_amount:.0f}"),    plus_amt],
-        [_b(trailing_label, "set:toggle:trailing"),
-         minus_tr, _noop(f"{s.trailing_offset_pct:.1f}%"), plus_tr],
+        [_b(trailing_label, "set:toggle:trailing")],
+        [_noop("🎯 Trail trigger"), minus_trig, _noop(f"{s.trailing_trigger_pct:.1f}%"), plus_trig],
+        [_noop("📏 Trail step"),    minus_step, _noop(f"{s.trailing_offset_pct:.1f}%"),  plus_step],
         [_noop("👥 Max pos"),     minus_mp,  _noop(str(s.max_positions)),       plus_mp],
         [_b(f"🔬 Stochastic  K={s.stoch_k}  D={s.stoch_d}  sm={s.stoch_smooth}",
             "set:menu:stoch")],
@@ -97,7 +99,7 @@ def _settings_text(s: Settings) -> str:
         f"• Timeframe: `{s.timeframe}` | Leverage: `{s.leverage}x`\n"
         f"• SL: `{s.sl_pct:.1f}%` | TP: `{s.tp_pct:.1f}%` | Amount: `{s.trade_amount:.0f}` USDT\n"
         f"• Trailing: `{'ON' if s.trailing_enabled else 'OFF'}` "
-        f"(offset `{s.trailing_offset_pct:.1f}%`)\n"
+        f"(trigger `{s.trailing_trigger_pct:.1f}%`, step `{s.trailing_offset_pct:.1f}%`)\n"
         f"• Max positions: `{s.max_positions}`\n"
         f"• Stoch: K=`{s.stoch_k}` D=`{s.stoch_d}` smooth=`{s.stoch_smooth}`"
     )
@@ -219,7 +221,7 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
                 new_val = max(Decimal("10"), current + delta)
                 await repo.update_setting(s, **{field: new_val})
 
-            elif field in {"sl_pct", "tp_pct", "equity_pct", "trailing_offset_pct"}:
+            elif field in {"sl_pct", "tp_pct", "equity_pct", "trailing_offset_pct", "trailing_trigger_pct"}:
                 current = getattr(cfg, field)
                 new_val = max(Decimal("0.1"), min(Decimal("100"), current + delta))
                 await repo.update_setting(s, **{field: new_val})

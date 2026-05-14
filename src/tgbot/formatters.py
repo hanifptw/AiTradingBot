@@ -258,7 +258,7 @@ def fmt_settings(s) -> str:
         f"• Timeframe: `{s.timeframe}`\n"
         f"• SL: `{s.sl_pct}%` | TP: `{s.tp_pct}%` | Amount: `{s.trade_amount:.0f}` USDT\n"
         f"• Trailing: `{'ON' if s.trailing_enabled else 'OFF'}` "
-        f"(offset `{s.trailing_offset_pct}%`)\n"
+        f"(trigger `{s.trailing_trigger_pct}%`, step `{s.trailing_offset_pct}%`)\n"
         f"• Leverage: `{s.leverage}x`\n"
         f"• Equity/trade: `{s.equity_pct}%`\n"
         f"• Max positions: `{s.max_positions}`\n"
