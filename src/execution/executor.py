@@ -8,6 +8,7 @@ already happened in the portfolio agent (caps + side validation).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from decimal import Decimal
 
@@ -17,7 +18,7 @@ from src.core.events import EntrySignal, ExitSignal, get_bus
 from src.core.models import Order, Position, Side
 from src.market.binance_client import get_binance
 from src.strategy.risk import position_size
-from src.tgbot.notifier import notify
+from src.tgbot.notifier import notify, notify_position_closed
 
 log = logging.getLogger(__name__)
 
@@ -183,52 +184,67 @@ async def _handle_entry(ev: EntrySignal) -> None:
 
 async def _handle_exit(ev: ExitSignal) -> None:
     binance = get_binance()
-    async with session() as s:
-        pos = await repo.open_position_for(s, ev.symbol)
-        if pos is None:
-            return
-        opposite = "SELL" if pos.side == "LONG" else "BUY"
-        close_resp = await binance.close_market_order(ev.symbol, opposite, pos.qty)
-        exit_price = _parse_fill_price(close_resp, ev.price)
+    # Snapshot for notify even if the close path raises midway.
+    side: str | None = None
+    entry_price: Decimal | None = None
+    exit_price: Decimal = ev.price
+    pnl: Decimal = Decimal("0")
+    notify_ready = False
+    try:
+        async with session() as s:
+            pos = await repo.open_position_for(s, ev.symbol)
+            if pos is None:
+                return
+            side = pos.side
+            entry_price = pos.entry_price
+            opposite = "SELL" if pos.side == "LONG" else "BUY"
+            close_resp = await binance.close_market_order(ev.symbol, opposite, pos.qty)
+            exit_price = _parse_fill_price(close_resp, ev.price)
 
-        if pos.sl_order_id:
-            await binance.cancel_order(ev.symbol, pos.sl_order_id)
-        if pos.tp_order_id:
-            await binance.cancel_order(ev.symbol, pos.tp_order_id)
+            if pos.sl_order_id:
+                with contextlib.suppress(Exception):
+                    await binance.cancel_order(ev.symbol, pos.sl_order_id)
+            if pos.tp_order_id:
+                with contextlib.suppress(Exception):
+                    await binance.cancel_order(ev.symbol, pos.tp_order_id)
 
-        direction = Decimal("1") if pos.side == "LONG" else Decimal("-1")
-        pnl = pos.qty * (exit_price - pos.entry_price) * direction
+            direction = Decimal("1") if pos.side == "LONG" else Decimal("-1")
+            pnl = pos.qty * (exit_price - pos.entry_price) * direction
+            notify_ready = True
 
-        entry_price = pos.entry_price
-        side = pos.side
-
-        await repo.add_order(
-            s,
-            Order(
-                position_id=pos.id,
+            await repo.add_order(
+                s,
+                Order(
+                    position_id=pos.id,
+                    symbol=ev.symbol,
+                    side=opposite,
+                    type="MARKET",
+                    qty=pos.qty,
+                    price=exit_price,
+                    binance_order_id=str(close_resp.get("orderId")),
+                    status=str(close_resp.get("status", "FILLED")),
+                    raw=close_resp,
+                ),
+            )
+            await repo.close_position(
+                s,
+                pos,
+                exit_price=exit_price,
+                realized_pnl=pnl,
+                reason=ev.reason,
+            )
+        log.info(
+            "Closed %s %s @%s  pnl=%s (reason=%s)", side, ev.symbol, exit_price, pnl, ev.reason
+        )
+    except Exception:
+        log.exception("_handle_exit failed for %s — sending notify anyway", ev.symbol)
+    finally:
+        if notify_ready and side is not None and entry_price is not None:
+            await notify_position_closed(
+                side=side,
                 symbol=ev.symbol,
-                side=opposite,
-                type="MARKET",
-                qty=pos.qty,
-                price=exit_price,
-                binance_order_id=str(close_resp.get("orderId")),
-                status=str(close_resp.get("status", "FILLED")),
-                raw=close_resp,
-            ),
-        )
-        await repo.close_position(
-            s,
-            pos,
-            exit_price=exit_price,
-            realized_pnl=pnl,
-            reason=ev.reason,
-        )
-
-    log.info("Closed %s %s @%s  pnl=%s (reason=%s)", side, ev.symbol, exit_price, pnl, ev.reason)
-    pnl_emoji = "✅" if pnl >= 0 else "🔴"
-    sign = "+" if pnl >= 0 else ""
-    await notify(
-        f"{pnl_emoji} *{side} {ev.symbol}* ditutup ({ev.reason})\n"
-        f"Entry: `{entry_price:.4f}` → Exit: `{exit_price:.4f}`\n"
-        f"PnL: `{sign}{pnl:.2f}` USDT"
-    )
+                entry_price=entry_price,
+                exit_price=exit_price,
+                pnl=pnl,
+                reason=ev.reason,
+            )

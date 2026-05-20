@@ -459,10 +459,8 @@ async def run_exit_poll_cycle() -> None:
                     decision_id=dec_id,
                 )
             )
-            await notify(
-                f"🤖 *AI exit {pos.side} {pos.symbol}* (conf `{item.confidence}%`)\n"
-                f"{item.reasoning[:200]}"
-            )
+            # The final close confirmation (with PnL) is sent by
+            # executor._handle_exit via notify_position_closed.
 
     _ = cfg  # silence
 

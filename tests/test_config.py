@@ -8,7 +8,7 @@ def test_universe_default():
     assert cfg.universe_symbols == ["BTCUSDT", "HYPEUSDT", "ZECUSDT"]
     assert cfg.openrouter_decision_model == "x-ai/grok-4.20"
     assert cfg.ohlcv_history_bars == 100
-    assert cfg.exit_poll_minutes == 30
+    assert cfg.exit_poll_minutes == 15
 
 
 def test_universe_parse_csv_string():

@@ -39,7 +39,7 @@ class AppConfig(BaseSettings):
     # Bars of 1h OHLCV sent to the LLM per coin in the portfolio call.
     ohlcv_history_bars: int = 100
     # Interval (minutes) between exit-monitor polls for open positions.
-    exit_poll_minutes: int = 30
+    exit_poll_minutes: int = 15
 
     db_path: Path = Path("./data/bot.db")
     log_level: str = "INFO"
