@@ -27,7 +27,9 @@ def _parse_fill(resp: dict, fallback: Decimal) -> Decimal:
     return fallback
 
 
-async def _resolve_fill(binance, resp: dict, close_side: str, symbol: str, fallback: Decimal) -> Decimal:
+async def _resolve_fill(
+    binance, resp: dict, close_side: str, symbol: str, fallback: Decimal
+) -> Decimal:
     """Get actual fill price from order response, falling back to recent trades.
 
     Binance testnet often returns avgPrice='0.00000' for MARKET orders.
@@ -138,10 +140,14 @@ async def handle_close_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.edit_message_text(
                     f"✅ *{symbol}* berhasil ditutup\nPnL: `{sign}{pnl:.2f}` USDT",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📊 Posisi", callback_data="menu:positions"),
-                         InlineKeyboardButton("← Menu", callback_data="menu:main")]
-                    ]),
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton("📊 Posisi", callback_data="menu:positions"),
+                                InlineKeyboardButton("← Menu", callback_data="menu:main"),
+                            ]
+                        ]
+                    ),
                 )
                 return
 
@@ -166,7 +172,6 @@ async def handle_close_callback(update: Update, context: ContextTypes.DEFAULT_TY
             entry_price = pos.entry_price
             side = pos.side
 
-            settings = await repo.get_settings(s)
             await repo.add_order(
                 s,
                 Order(
@@ -182,11 +187,11 @@ async def handle_close_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 ),
             )
             await repo.close_position(
-                s, pos,
+                s,
+                pos,
                 exit_price=exit_price,
                 realized_pnl=pnl,
                 reason="MANUAL",
-                sl_pct=settings.sl_pct,
             )
 
         sign = "+" if pnl >= 0 else ""
@@ -198,10 +203,14 @@ async def handle_close_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"✅ *{symbol}* berhasil ditutup\nPnL: `{sign}{pnl:.2f}` USDT",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📊 Posisi", callback_data="menu:positions"),
-                 InlineKeyboardButton("← Menu", callback_data="menu:main")]
-            ]),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("📊 Posisi", callback_data="menu:positions"),
+                        InlineKeyboardButton("← Menu", callback_data="menu:main"),
+                    ]
+                ]
+            ),
         )
 
     elif data.startswith("close_pos:"):
@@ -209,10 +218,14 @@ async def handle_close_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"Yakin mau close posisi *{symbol}* secara manual?",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
+            reply_markup=InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton("✅ Ya, Close", callback_data=f"close_pos:ok:{symbol}"),
-                    InlineKeyboardButton("❌ Batal", callback_data="menu:positions"),
+                    [
+                        InlineKeyboardButton(
+                            "✅ Ya, Close", callback_data=f"close_pos:ok:{symbol}"
+                        ),
+                        InlineKeyboardButton("❌ Batal", callback_data="menu:positions"),
+                    ]
                 ]
-            ]),
+            ),
         )

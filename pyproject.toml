@@ -1,7 +1,7 @@
 [project]
 name = "binance-trading-bot"
 version = "0.1.0"
-description = "Telegram-controlled Binance Futures bot with Stochastic 2-stage signal and AI trade evaluator"
+description = "Telegram-controlled Binance Futures bot, fully driven by Grok 4.20 (nof1-style) on the 1h timeframe"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "python-binance>=1.0.19",

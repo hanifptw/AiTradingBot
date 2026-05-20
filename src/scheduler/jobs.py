@@ -1,134 +1,55 @@
 """Cron-style jobs orchestrated by APScheduler.
 
-`refresh_universe` runs every 6h and replaces the monitored-symbols list.
-`poll_klines_and_signal` runs once per minute and only acts on each symbol when
-the configured timeframe has produced a freshly-closed bar (cheap idempotency
-on `close_time`).
+- portfolio_bar_close_job: runs at the top of every hour (a few seconds after
+  bar close) and invokes the AI portfolio agent.
+- exit_monitor_job: runs every `exit_poll_minutes` and re-evaluates only the
+  currently open positions.
+- sync_positions: reconciles DB open positions against Binance (detects SL/TP/
+  liquidation fills the bot didn't observe).
+- daily_ai_report: invokes the deep evaluator at the end of each day.
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
-from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal
 
-from src.ai.decision import should_exit_early
 from src.ai.evaluator import generate_report
 from src.core import repository as repo
 from src.core.db import session
-from src.core.events import ExitSignal, get_bus
-from src.execution.trailing import _valid_order_id, run_trailing_tick
-from src.indicators.stochastic import StochParams
 from src.market.binance_client import get_binance
-from src.market.universe import fetch_top_universe
-from src.strategy.signal_engine import process_symbol
+from src.strategy import portfolio_agent
 from src.tgbot.notifier import notify
 
 log = logging.getLogger(__name__)
 
-# symbol -> last processed bar close_time (UTC ms)
-_last_bar_seen: dict[str, int] = defaultdict(int)
 
-
-async def refresh_universe() -> None:
-    binance = get_binance()
+async def portfolio_bar_close_job() -> None:
     try:
-        perpetuals = await binance.usdt_perpetual_symbols()
-        items = await fetch_top_universe(perpetuals)
-        async with session() as s:
-            await repo.replace_universe(s, items)
-        log.info("Universe refreshed: %d symbols", len(items))
+        await portfolio_agent.run_bar_close_cycle()
     except Exception:
-        log.exception("Universe refresh failed")
+        log.exception("Portfolio bar-close job failed")
 
 
-async def poll_klines_and_signal() -> None:
-    binance = get_binance()
-    async with session() as s:
-        settings = await repo.get_settings(s)
-        universe = await repo.list_universe(s)
-    if not universe:
-        log.info("Universe empty — refreshing first")
-        await refresh_universe()
-        async with session() as s:
-            universe = await repo.list_universe(s)
-
-    params = StochParams(k=settings.stoch_k, d=settings.stoch_d, smooth=settings.stoch_smooth)
-    # Fan out symbol fetches with bounded concurrency.
-    sem = asyncio.Semaphore(5)
-
-    async def _process(sym: str) -> None:
-        async with sem:
-            try:
-                df = await binance.klines(sym, settings.timeframe, limit=200)
-                if df.empty:
-                    return
-                # Only act when a new closed bar appears. Binance returns the in-progress
-                # bar as the last row; we drop it.
-                df_closed = df.iloc[:-1]
-                if df_closed.empty:
-                    return
-                latest_closed_ms = int(df_closed["close_time"].iloc[-1].value // 1_000_000)
-                if latest_closed_ms <= _last_bar_seen[sym]:
-                    return
-                _last_bar_seen[sym] = latest_closed_ms
-                await process_symbol(sym, df_closed, params)
-
-                # AI early-exit check — runs once per bar close, only for symbols
-                # with an OPEN position. Reuses df_closed (no extra Binance call).
-                if not settings.ai_early_exit_enabled:
-                    return
-                async with session() as s2:
-                    pos = await repo.open_position_for(s2, sym)
-                if pos is None:
-                    return
-                last_close = Decimal(str(df_closed["close"].iloc[-1]))
-                decision = await should_exit_early(
-                    pos=pos,
-                    current_price=last_close,
-                    timeframe=settings.timeframe,
-                    df=df_closed,
-                    params=params,
-                )
-                if decision.exit:
-                    log.info(
-                        "AI early-exit %s %s (conf=%d): %s",
-                        pos.side, sym, decision.confidence, decision.reason,
-                    )
-                    await get_bus().publish(ExitSignal(
-                        symbol=sym, reason="AI_EARLY_EXIT", price=last_close,
-                    ))
-                    await notify(
-                        f"🤖 *AI early-exit {pos.side} {sym}* "
-                        f"(conf `{decision.confidence}%`)\n{decision.reason}"
-                    )
-            except Exception:
-                log.exception("kline/signal failed for %s", sym)
-
-    await asyncio.gather(*(_process(u.symbol) for u in universe))
-
-
-async def trailing_tick() -> None:
+async def exit_monitor_job() -> None:
     try:
-        await run_trailing_tick()
+        await portfolio_agent.run_exit_poll_cycle()
     except Exception:
-        log.exception("Trailing tick failed")
+        log.exception("Exit-monitor job failed")
 
 
 async def sync_positions() -> None:
-    """Detect positions closed by Binance's SL/liquidation and reconcile the DB.
+    """Detect positions closed by Binance's SL/TP/liquidation and reconcile DB.
 
-    Called every 2 minutes. Compares DB open positions against actual Binance
-    positions. When a position is gone from Binance but still OPEN in our DB,
-    we close it and reset the signal state so new signals can fire.
+    Called periodically. When a position is gone from Binance but still OPEN
+    in our DB, we close it locally, infer the close reason from price levels,
+    and notify Telegram.
     """
     binance = get_binance()
     async with session() as s:
         db_open = await repo.open_positions(s)
-        settings = await repo.get_settings(s)
 
     if not db_open:
         return
@@ -148,8 +69,10 @@ async def sync_positions() -> None:
             continue
 
         log.warning(
-            "sync_positions: %s %s (id=%d) gone from Binance — closing in DB as SL",
-            pos.side, pos.symbol, pos.id,
+            "sync_positions: %s %s (id=%d) gone from Binance — closing in DB",
+            pos.side,
+            pos.symbol,
+            pos.id,
         )
 
         exit_price = pos.entry_price  # safe fallback
@@ -157,7 +80,8 @@ async def sync_positions() -> None:
             trades = await binance.recent_user_trades(pos.symbol, limit=10)
             close_side = "SELL" if pos.side == "LONG" else "BUY"
             candidates = [
-                t for t in trades
+                t
+                for t in trades
                 if t.get("side", "").upper() == close_side
                 and int(t.get("time", 0)) >= int(pos.opened_at.timestamp() * 1000)
             ]
@@ -180,7 +104,6 @@ async def sync_positions() -> None:
         ):
             reason = "TP"
         elif pos.sl_price and pos.sl_price > 0:
-            # Exit more than 2% away from SL level → not an SL fill → manual close.
             near_sl = abs(exit_price - pos.sl_price) / pos.sl_price <= Decimal("0.02")
             if not near_sl:
                 reason = "MANUAL"
@@ -188,44 +111,54 @@ async def sync_positions() -> None:
         async with session() as s:
             pos2 = await repo.open_position_for(s, pos.symbol)
             if pos2 is None:
-                continue  # Already closed by another path
-            # Cancel the order that didn't fire (Binance may auto-cancel, but be explicit).
-            if reason == "TP" and _valid_order_id(pos2.sl_order_id):
+                continue
+            # Cancel the order that didn't fire.
+            if reason == "TP" and pos2.sl_order_id:
                 with contextlib.suppress(Exception):
                     await binance.cancel_order(pos.symbol, pos2.sl_order_id)
-            elif reason in ("SL", "MANUAL") and _valid_order_id(pos2.tp_order_id):
+            elif reason in ("SL", "MANUAL") and pos2.tp_order_id:
                 with contextlib.suppress(Exception):
                     await binance.cancel_order(pos.symbol, pos2.tp_order_id)
-            if reason in ("SL", "MANUAL") and _valid_order_id(pos2.sl_order_id):
-                with contextlib.suppress(Exception):
-                    await binance.cancel_order(pos.symbol, pos2.sl_order_id)
             await repo.close_position(
-                s, pos2,
+                s,
+                pos2,
                 exit_price=exit_price,
                 realized_pnl=pnl,
                 reason=reason,
-                sl_pct=settings.sl_pct,
             )
 
         sign = "+" if pnl >= 0 else ""
         emoji = "🎯" if reason == "TP" else ("✋" if reason == "MANUAL" else "🛑")
-        label = "kena TP" if reason == "TP" else ("ditutup manual" if reason == "MANUAL" else "kena SL")
+        label = (
+            "kena TP" if reason == "TP" else ("ditutup manual" if reason == "MANUAL" else "kena SL")
+        )
         await notify(
             f"{emoji} *{pos.side} {pos.symbol}* {label}\n"
             f"Entry: `{pos.entry_price:.4f}` → Exit: `{exit_price:.4f}`\n"
             f"PnL: `{sign}{pnl:.2f}` USDT"
         )
 
-    # After closing any externally-closed positions, reset orphaned signal states.
-    async with session() as s:
-        reset = await repo.reconcile_states(s)
-    if reset:
-        log.warning("sync_positions: reconciled %d orphaned signal states → IDLE", reset)
 
-
-async def weekly_ai_report() -> None:
+async def daily_ai_report() -> None:
     try:
-        log.info("Running weekly AI report at %s", datetime.utcnow().isoformat())
-        await generate_report(trigger="weekly")
+        log.info("Running daily AI report at %s", datetime.utcnow().isoformat())
+        await generate_report(trigger="daily")
     except Exception:
-        log.exception("Weekly AI report failed")
+        log.exception("Daily AI report failed")
+
+
+async def validate_universe_on_startup() -> None:
+    """One-shot: ensure every configured universe symbol exists on Binance Futures USDT-M."""
+    from src.config import get_config
+
+    cfg = get_config()
+    binance = get_binance()
+    try:
+        valid = await binance.usdt_perpetual_symbols()
+    except Exception:
+        log.exception("Failed to fetch exchange info — skipping universe validation")
+        return
+    missing = [s for s in cfg.universe_symbols if s not in valid]
+    if missing:
+        log.error("Configured universe symbols not listed on Binance Futures: %s", missing)
+        await notify(f"⚠️ Symbol tidak ditemukan di Binance Futures USDT-M: `{', '.join(missing)}`")

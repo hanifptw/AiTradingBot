@@ -12,28 +12,22 @@ from src.scheduler import jobs
 log = logging.getLogger(__name__)
 
 
-def build_scheduler() -> AsyncIOScheduler:
+def build_scheduler(exit_poll_minutes: int) -> AsyncIOScheduler:
     cfg = get_config()
     scheduler = AsyncIOScheduler(timezone=cfg.timezone)
+    # Portfolio cycle: fires 10s after each 1h close to make sure the kline is
+    # finalized. Use UTC for the cron, then convert via scheduler timezone.
     scheduler.add_job(
-        jobs.refresh_universe,
-        IntervalTrigger(hours=6),
-        next_run_time=None,  # we manually call once at startup
-        id="universe",
+        jobs.portfolio_bar_close_job,
+        CronTrigger(minute=0, second=10, timezone="UTC"),
+        id="portfolio_bar_close",
         max_instances=1,
         coalesce=True,
     )
     scheduler.add_job(
-        jobs.poll_klines_and_signal,
-        IntervalTrigger(seconds=60),
-        id="klines",
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        jobs.trailing_tick,
-        IntervalTrigger(seconds=30),
-        id="trailing",
+        jobs.exit_monitor_job,
+        IntervalTrigger(minutes=exit_poll_minutes),
+        id="exit_monitor",
         max_instances=1,
         coalesce=True,
     )
@@ -45,9 +39,9 @@ def build_scheduler() -> AsyncIOScheduler:
         coalesce=True,
     )
     scheduler.add_job(
-        jobs.weekly_ai_report,
-        CronTrigger(day_of_week="sun", hour=23, minute=0, timezone=cfg.timezone),
-        id="weekly_ai",
+        jobs.daily_ai_report,
+        CronTrigger(hour=0, minute=5, timezone="UTC"),
+        id="daily_ai",
         max_instances=1,
         coalesce=True,
     )

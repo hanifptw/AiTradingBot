@@ -8,14 +8,6 @@ from sqlalchemy import JSON, DateTime, Index, Integer, Numeric, String, UniqueCo
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
-class SignalState(str, Enum):
-    IDLE = "IDLE"
-    LONG_ARMED = "LONG_ARMED"
-    SHORT_ARMED = "SHORT_ARMED"
-    IN_LONG = "IN_LONG"
-    IN_SHORT = "IN_SHORT"
-
-
 class Side(str, Enum):
     LONG = "LONG"
     SHORT = "SHORT"
@@ -31,7 +23,7 @@ class CloseReason(str, Enum):
     SL = "SL"
     MANUAL = "MANUAL"
     LIQUIDATED = "LIQUIDATED"
-    AI_EARLY_EXIT = "AI_EARLY_EXIT"
+    AI_EXIT = "AI_EXIT"  # AI portfolio call OR exit-monitor poll
 
 
 class Base(DeclarativeBase):
@@ -45,53 +37,19 @@ class Settings(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    timeframe: Mapped[str] = mapped_column(String, default="15m")
-    sl_pct: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=Decimal("2.0"))
-    trailing_enabled: Mapped[bool] = mapped_column(default=False)
-    trailing_trigger_pct: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=Decimal("1.0"))
-    trailing_offset_pct: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=Decimal("0.5"))
-    leverage: Mapped[int] = mapped_column(Integer, default=5)
-    equity_pct: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=Decimal("2.0"))
-    trade_amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("100.0"))
-    max_positions: Mapped[int] = mapped_column(Integer, default=5)
-
-    stoch_k: Mapped[int] = mapped_column(Integer, default=14)
-    stoch_d: Mapped[int] = mapped_column(Integer, default=3)
-    stoch_smooth: Mapped[int] = mapped_column(Integer, default=3)
-
-    tp_pct: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=Decimal("3.0"))
+    # Mode and autotrade gate.
     mode: Mapped[str] = mapped_column(String, default="testnet")
     autotrade_enabled: Mapped[bool] = mapped_column(default=False)
 
-    ai_entry_filter_enabled: Mapped[bool] = mapped_column(default=True)
-    ai_early_exit_enabled: Mapped[bool] = mapped_column(default=True)
-    ai_min_confidence: Mapped[int] = mapped_column(Integer, default=60)
-
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.utcnow()
+    # Safety caps applied to every AI-issued trade.
+    max_leverage_cap: Mapped[int] = mapped_column(Integer, default=10)
+    max_equity_per_trade_pct: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4), default=Decimal("20.0")
     )
 
+    # Exit-monitor cadence (minutes). 1h bar-close cycle runs separately.
+    exit_poll_minutes: Mapped[int] = mapped_column(Integer, default=30)
 
-class MonitoredSymbol(Base):
-    __tablename__ = "monitored_symbols"
-
-    symbol: Mapped[str] = mapped_column(String, primary_key=True)  # e.g. BTCUSDT
-    base_asset: Mapped[str] = mapped_column(String)
-    mcap_rank: Mapped[int] = mapped_column(Integer)
-    last_refreshed: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.utcnow()
-    )
-
-
-class SignalStateRow(Base):
-    __tablename__ = "signal_states"
-
-    symbol: Mapped[str] = mapped_column(String, primary_key=True)
-    state: Mapped[str] = mapped_column(String, default=SignalState.IDLE.value)
-    last_k: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
-    last_d: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
-    armed_at_bar: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    armed_extreme_k: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.utcnow()
     )
@@ -114,6 +72,9 @@ class Position(Base):
     sl_order_id: Mapped[str | None] = mapped_column(String, nullable=True)
     tp_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10), nullable=True)
     tp_order_id: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # FK-ish (not enforced) to the AIDecision that opened this position.
+    entry_decision_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     realized_pnl: Mapped[Decimal | None] = mapped_column(Numeric(30, 10), nullable=True)
     close_reason: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -170,10 +131,12 @@ class Trade(Base):
 
 
 class AIReport(Base):
+    """Daily/on-demand AI evaluator output (Sonnet 4.5)."""
+
     __tablename__ = "ai_reports"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    trigger: Mapped[str] = mapped_column(String)  # 'on_demand' | 'weekly'
+    trigger: Mapped[str] = mapped_column(String)  # 'on_demand' | 'daily'
     model: Mapped[str] = mapped_column(String)
     trades_count: Mapped[int] = mapped_column(Integer)
     report_md: Mapped[str] = mapped_column(String)
@@ -183,20 +146,27 @@ class AIReport(Base):
 
 
 class AIDecision(Base):
-    """Audit log for AI entry-filter and early-exit decisions."""
+    """Audit log for AI portfolio + exit-monitor decisions."""
 
     __tablename__ = "ai_decisions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    decision_type: Mapped[str] = mapped_column(String, index=True)  # 'ENTRY' | 'EARLY_EXIT'
+    decision_type: Mapped[str] = mapped_column(String, index=True)  # 'PORTFOLIO' | 'EXIT_MONITOR'
     symbol: Mapped[str] = mapped_column(String, index=True)
-    side: Mapped[str] = mapped_column(String)
-    action: Mapped[str] = mapped_column(String)  # APPROVE / REJECT / EXIT / HOLD
+    side: Mapped[str | None] = mapped_column(String, nullable=True)
+    action: Mapped[str] = mapped_column(String)  # OPEN_LONG / OPEN_SHORT / CLOSE / HOLD
     confidence: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reason: Mapped[str | None] = mapped_column(String, nullable=True)
     model: Mapped[str] = mapped_column(String)
     raw_response: Mapped[str | None] = mapped_column(String, nullable=True)
     position_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+    # AI-issued trade params (snapshotted at decision time, pre-cap-clamp).
+    size_pct_equity: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    leverage: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sl_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10), nullable=True)
+    tp_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.utcnow()
     )

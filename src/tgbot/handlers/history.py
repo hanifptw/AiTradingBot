@@ -14,10 +14,12 @@ from src.tgbot.formatters import fmt_trade_row
 
 
 def _history_markup() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Reset PnL", callback_data="history:reset_confirm")],
-        [InlineKeyboardButton("← Menu", callback_data="menu:main")],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Reset PnL", callback_data="history:reset_confirm")],
+            [InlineKeyboardButton("← Menu", callback_data="menu:main")],
+        ]
+    )
 
 
 async def _render_history(update: Update) -> None:
@@ -63,12 +65,14 @@ async def handle_history_callback(update: Update, context: ContextTypes.DEFAULT_
                 "⚠️ *Reset semua data PnL?*\n"
                 "Semua history trade akan dihapus permanen dan tidak bisa dikembalikan.",
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([
+                reply_markup=InlineKeyboardMarkup(
                     [
-                        InlineKeyboardButton("✅ Ya, Reset", callback_data="history:reset_do"),
-                        InlineKeyboardButton("❌ Batal", callback_data="history:show"),
+                        [
+                            InlineKeyboardButton("✅ Ya, Reset", callback_data="history:reset_do"),
+                            InlineKeyboardButton("❌ Batal", callback_data="history:show"),
+                        ]
                     ]
-                ]),
+                ),
             )
 
     elif data == "history:reset_do":
@@ -77,9 +81,9 @@ async def handle_history_callback(update: Update, context: ContextTypes.DEFAULT_
         with contextlib.suppress(BadRequest):
             await query.edit_message_text(
                 f"✅ Berhasil reset — {deleted} trade dihapus.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("← Menu", callback_data="menu:main")]
-                ]),
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("← Menu", callback_data="menu:main")]]
+                ),
             )
 
     elif data == "history:show":

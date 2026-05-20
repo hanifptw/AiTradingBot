@@ -43,6 +43,7 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     markup = main_menu_markup()
     if update.callback_query:
         from telegram.error import BadRequest
+
         try:
             await update.callback_query.edit_message_text("Menu:", reply_markup=markup)
         except BadRequest:

@@ -32,8 +32,10 @@ async def show_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         positions = await binance.all_open_positions()
         open_count = len(positions)
         upnl = sum(
-            (Decimal(str(p.get("unRealizedProfit") or p.get("unrealizedProfit") or "0"))
-             for p in positions),
+            (
+                Decimal(str(p.get("unRealizedProfit") or p.get("unrealizedProfit") or "0"))
+                for p in positions
+            ),
             Decimal("0"),
         )
 

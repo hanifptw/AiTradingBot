@@ -16,4 +16,5 @@ def restricted(handler):
         if user is None or user.id not in allowed:
             return  # drop silently — don't reveal the bot to randos
         return await handler(update, context)
+
     return wrapper

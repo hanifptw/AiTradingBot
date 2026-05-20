@@ -25,7 +25,6 @@ def _configure_logging(level: str) -> None:
         format="%(asctime)s %(levelname)-7s %(name)s :: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # Tame chatty libraries.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
@@ -33,22 +32,18 @@ def _configure_logging(level: str) -> None:
 async def amain() -> None:
     cfg = get_config()
     _configure_logging(cfg.log_level)
-    log.info("Starting bot — mode=%s", cfg.mode.value)
+    log.info("Starting bot — mode=%s universe=%s", cfg.mode.value, cfg.universe_symbols)
 
     await init_db()
 
-    # Reset any IN_LONG/IN_SHORT states that lost their position on a previous crash.
-    async with session() as s:
-        reset = await repo.reconcile_states(s)
-    if reset:
-        log.warning("Reconciled %d orphaned signal states → IDLE", reset)
-
-    # Warm exchange filters and load universe before the first signal tick.
+    # Warm exchange filter cache and validate configured universe.
     binance = get_binance()
     await binance.exchange_info()
-    await jobs.refresh_universe()
+    await jobs.validate_universe_on_startup()
 
-    scheduler = build_scheduler()
+    async with session() as s:
+        settings = await repo.get_settings(s)
+    scheduler = build_scheduler(settings.exit_poll_minutes)
     scheduler.start()
 
     tg_app = build_app()

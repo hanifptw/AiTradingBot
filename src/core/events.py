@@ -1,8 +1,7 @@
 """Lightweight in-process pub/sub built on asyncio.Queue.
 
-Strategy emits EntrySignal/ExitSignal/StateChanged events; Execution and Telegram
-subscribe. Keeping this in-process avoids the operational overhead of Redis/etc.
-for a single-user bot.
+The Portfolio agent emits EntrySignal/ExitSignal events with the AI's chosen
+trade params already populated. The executor is the sole consumer.
 """
 
 from __future__ import annotations
@@ -12,31 +11,33 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from decimal import Decimal
 
-from src.core.models import Side, SignalState
+from src.core.models import Side
 
 
 @dataclass(frozen=True)
 class EntrySignal:
     symbol: str
     side: Side
-    price: Decimal  # last close as reference; executor uses MARKET
+    price: Decimal  # last close reference; executor still uses MARKET
+    size_pct_equity: Decimal  # 0–100, capped by max_equity_per_trade_pct
+    leverage: int  # 1..N, capped by max_leverage_cap
+    sl_price: Decimal
+    tp_price: Decimal
+    confidence: int  # 0–100
+    decision_id: int  # AIDecision row id (audit trail)
+    reason: str = "AI_PORTFOLIO"
 
 
 @dataclass(frozen=True)
 class ExitSignal:
     symbol: str
-    reason: str  # 'TP' (cross back) — SL handled by Binance stop order
+    position_id: int
+    reason: str  # 'AI_EXIT' | 'MANUAL'
     price: Decimal
+    decision_id: int | None = None
 
 
-@dataclass(frozen=True)
-class StateChanged:
-    symbol: str
-    old: SignalState
-    new: SignalState
-
-
-Event = EntrySignal | ExitSignal | StateChanged
+Event = EntrySignal | ExitSignal
 
 
 class EventBus:

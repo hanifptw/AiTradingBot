@@ -1,7 +1,9 @@
 """Subscribes to EntrySignal/ExitSignal and places orders on Binance Futures.
 
-The executor is intentionally the only module allowed to call binance_client
-for order placement, so swapping in a paper executor later is a one-line change.
+The executor is the only module allowed to call binance_client for order
+placement. EntrySignal payloads carry the AI-issued size/leverage/SL/TP
+directly — the executor does no strategy logic, only clamping that has
+already happened in the portfolio agent (caps + side validation).
 """
 
 from __future__ import annotations
@@ -9,14 +11,12 @@ from __future__ import annotations
 import logging
 from decimal import Decimal
 
-from src.ai.decision import confirm_entry
 from src.core import repository as repo
 from src.core.db import session
 from src.core.events import EntrySignal, ExitSignal, get_bus
 from src.core.models import Order, Position, Side
-from src.indicators.stochastic import StochParams
 from src.market.binance_client import get_binance
-from src.strategy.risk import position_size, sl_price, tp_price
+from src.strategy.risk import position_size
 from src.tgbot.notifier import notify
 
 log = logging.getLogger(__name__)
@@ -67,81 +67,42 @@ async def _handle_entry(ev: EntrySignal) -> None:
             log.info("Autotrade disabled — skipping entry %s %s", ev.side.value, ev.symbol)
             return
 
-        # Don't double-up on a symbol already in a position.
         existing = await repo.open_position_for(s, ev.symbol)
         if existing is not None:
             log.info("Position already open for %s — skipping new entry", ev.symbol)
             return
 
-        # Respect max-concurrent-positions cap.
-        open_now = await repo.open_positions(s)
-        if len(open_now) >= settings.max_positions:
-            log.info("Max positions (%d) reached — skipping %s", settings.max_positions, ev.symbol)
-            return
-
+        wallet, _avail = await binance.account_balance_usdt()
         sizing = position_size(
-            trade_amount=settings.trade_amount,
-            leverage=settings.leverage,
+            equity=wallet,
+            size_pct=ev.size_pct_equity,
+            leverage=ev.leverage,
             entry_price=ev.price,
         )
         await binance.exchange_info()  # warms filter cache
         qty = binance.quantize_qty(ev.symbol, sizing.qty)
         if qty <= 0:
-            log.warning("Computed qty=0 for %s (sizing=%s) — skipping", ev.symbol, sizing)
+            log.warning(
+                "Computed qty=0 for %s (equity=%s, size_pct=%s, lev=%s) — skipping",
+                ev.symbol,
+                wallet,
+                ev.size_pct_equity,
+                ev.leverage,
+            )
             return
 
-        # AI pre-trade filter — reject if structure/momentum/SD/R:R look unfavorable.
-        if settings.ai_entry_filter_enabled:
-            sl_raw = sl_price(side=ev.side.value, entry=ev.price, sl_pct=settings.sl_pct)
-            tp_raw = tp_price(side=ev.side.value, entry=ev.price, tp_pct=settings.tp_pct)
-            df = await binance.klines(ev.symbol, settings.timeframe, limit=200)
-            df_closed = df.iloc[:-1] if not df.empty else df
-            decision = await confirm_entry(
-                symbol=ev.symbol,
-                side=ev.side,
-                entry_price=ev.price,
-                sl_price=sl_raw,
-                tp_price=tp_raw,
-                sl_pct=settings.sl_pct,
-                tp_pct=settings.tp_pct,
-                timeframe=settings.timeframe,
-                df=df_closed,
-                params=StochParams(
-                    k=settings.stoch_k, d=settings.stoch_d, smooth=settings.stoch_smooth,
-                ),
-                min_confidence=settings.ai_min_confidence,
-            )
-            if not decision.approve:
-                log.info(
-                    "AI rejected %s %s (conf=%d): %s",
-                    ev.side.value, ev.symbol, decision.confidence, decision.reason,
-                )
-                await notify(
-                    f"🤖 *AI skip {ev.side.value} {ev.symbol}* "
-                    f"(conf `{decision.confidence}%`)\n{decision.reason}"
-                )
-                return
-            log.info(
-                "AI approved %s %s (conf=%d): %s",
-                ev.side.value, ev.symbol, decision.confidence, decision.reason,
-            )
-
-        await binance.set_leverage(ev.symbol, settings.leverage)
+        await binance.set_leverage(ev.symbol, ev.leverage)
 
         binance_side = "BUY" if ev.side is Side.LONG else "SELL"
         market_resp = await binance.market_order(ev.symbol, binance_side, qty)
         fill_price = _parse_fill_price(market_resp, ev.price)
 
-        # Stop-loss (reduce-only stop market at sl_pct from entry).
-        sl_raw = sl_price(side=ev.side.value, entry=fill_price, sl_pct=settings.sl_pct)
-        sl_quant = binance.quantize_price(ev.symbol, sl_raw)
+        sl_quant = binance.quantize_price(ev.symbol, ev.sl_price)
         sl_side = "SELL" if ev.side is Side.LONG else "BUY"
         sl_resp = await binance.stop_market_reduce_only(ev.symbol, sl_side, sl_quant)
 
-        # Take-profit (take-profit market at tp_pct from entry).
-        tp_raw = tp_price(side=ev.side.value, entry=fill_price, tp_pct=settings.tp_pct)
-        tp_quant = binance.quantize_price(ev.symbol, tp_raw)
-        tp_side = sl_side  # same direction as SL
+        tp_quant = binance.quantize_price(ev.symbol, ev.tp_price)
+        tp_side = sl_side
         tp_resp = await binance.take_profit_market_reduce_only(ev.symbol, tp_side, tp_quant)
 
         pos = Position(
@@ -150,11 +111,12 @@ async def _handle_entry(ev: EntrySignal) -> None:
             mode=settings.mode,
             qty=qty,
             entry_price=fill_price,
-            leverage=settings.leverage,
+            leverage=ev.leverage,
             sl_price=sl_quant,
             sl_order_id=(str(oid) if (oid := sl_resp.get("orderId")) else None),
             tp_price=tp_quant,
             tp_order_id=(str(oid) if (oid := tp_resp.get("orderId")) else None),
+            entry_decision_id=ev.decision_id,
         )
         pos = await repo.create_position(s, pos)
 
@@ -200,17 +162,22 @@ async def _handle_entry(ev: EntrySignal) -> None:
                 raw=tp_resp,
             ),
         )
-        lev = settings.leverage
 
     log.info(
-        "Opened %s %s qty=%s @%s  SL=%s  TP=%s",
-        ev.side.value, ev.symbol, qty, fill_price, sl_quant, tp_quant,
+        "Opened %s %s qty=%s @%s  SL=%s  TP=%s  (conf=%d)",
+        ev.side.value,
+        ev.symbol,
+        qty,
+        fill_price,
+        sl_quant,
+        tp_quant,
+        ev.confidence,
     )
     side_emoji = "🟢" if ev.side is Side.LONG else "🔴"
     await notify(
-        f"{side_emoji} *{ev.side.value} {ev.symbol}* terbuka\n"
+        f"{side_emoji} *{ev.side.value} {ev.symbol}* terbuka (AI conf `{ev.confidence}%`)\n"
         f"Entry: `{fill_price:.4f}` | SL: `{sl_quant:.4f}` | TP: `{tp_quant:.4f}`\n"
-        f"Qty: `{_fq(qty)}` | Lev: `{lev}x`"
+        f"Qty: `{_fq(qty)}` | Lev: `{ev.leverage}x` | Size: `{ev.size_pct_equity:.1f}%`"
     )
 
 
@@ -220,27 +187,21 @@ async def _handle_exit(ev: ExitSignal) -> None:
         pos = await repo.open_position_for(s, ev.symbol)
         if pos is None:
             return
-        # Close with opposite reduceOnly MARKET order.
-        # reduceOnly=True prevents accidentally opening a new position if Binance's
-        # SL order already fired and closed this position before this TP signal arrived.
         opposite = "SELL" if pos.side == "LONG" else "BUY"
         close_resp = await binance.close_market_order(ev.symbol, opposite, pos.qty)
         exit_price = _parse_fill_price(close_resp, ev.price)
 
-        # Cancel SL and TP orders now that we're flat.
         if pos.sl_order_id:
             await binance.cancel_order(ev.symbol, pos.sl_order_id)
         if pos.tp_order_id:
             await binance.cancel_order(ev.symbol, pos.tp_order_id)
 
-        # Realized PnL (linear futures): qty * (exit - entry), inverted for shorts.
         direction = Decimal("1") if pos.side == "LONG" else Decimal("-1")
         pnl = pos.qty * (exit_price - pos.entry_price) * direction
 
         entry_price = pos.entry_price
         side = pos.side
 
-        settings = await repo.get_settings(s)
         await repo.add_order(
             s,
             Order(
@@ -256,11 +217,11 @@ async def _handle_exit(ev: ExitSignal) -> None:
             ),
         )
         await repo.close_position(
-            s, pos,
+            s,
+            pos,
             exit_price=exit_price,
             realized_pnl=pnl,
             reason=ev.reason,
-            sl_pct=settings.sl_pct,
         )
 
     log.info("Closed %s %s @%s  pnl=%s (reason=%s)", side, ev.symbol, exit_price, pnl, ev.reason)

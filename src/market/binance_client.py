@@ -88,8 +88,18 @@ class BinanceFutures:
         df = pd.DataFrame(
             rows,
             columns=[
-                "open_time", "open", "high", "low", "close", "volume",
-                "close_time", "qav", "trades", "tbav", "tqav", "ignore",
+                "open_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "qav",
+                "trades",
+                "tbav",
+                "tqav",
+                "ignore",
             ],
         )
         for col in ("open", "high", "low", "close", "volume"):
