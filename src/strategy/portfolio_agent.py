@@ -13,7 +13,9 @@ response (fail-safe: no action).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pandas as pd
@@ -29,8 +31,10 @@ from src.tgbot.notifier import notify
 
 log = logging.getLogger(__name__)
 
-# Per-process idempotency: last 1h bar close_time (ms) we processed.
-_last_bar_seen_ms: int = 0
+# Serializes overlapping invocations of the bar-close / exit-poll cycles so
+# a slow LLM call can't be lapped by the next scheduler tick.
+_bar_cycle_lock = asyncio.Lock()
+_exit_cycle_lock = asyncio.Lock()
 
 
 def _position_view(pos: Position, mark_price: Decimal | None) -> dict:
@@ -39,6 +43,14 @@ def _position_view(pos: Position, mark_price: Decimal | None) -> dict:
     upnl_pct = Decimal("0")
     if mark_price is not None and pos.entry_price > 0:
         upnl_pct = (mark_price - pos.entry_price) / pos.entry_price * Decimal("100") * direction
+
+    # Bars open on the 1h timeframe. opened_at is stored as tz-aware UTC.
+    now = datetime.now(UTC)
+    opened = pos.opened_at
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=UTC)
+    bars_open = max(0, int((now - opened).total_seconds() // 3600))
+
     return {
         "id": pos.id,
         "symbol": pos.symbol,
@@ -49,8 +61,7 @@ def _position_view(pos: Position, mark_price: Decimal | None) -> dict:
         "tp_price": f"{float(pos.tp_price):.6g}" if pos.tp_price else "n/a",
         "leverage": pos.leverage,
         "upnl_pct": float(upnl_pct),
-        # bars_open is approximated by caller (needs current time).
-        "bars_open": 0,
+        "bars_open": bars_open,
     }
 
 
@@ -99,15 +110,30 @@ async def _latest_bar_close_ms(symbols: list[str]) -> int:
 
 async def run_bar_close_cycle() -> None:
     """Top-level entrypoint called by the scheduler at minute 0:10 after each 1h close."""
-    global _last_bar_seen_ms
+    if _bar_cycle_lock.locked():
+        log.info("Bar-close cycle already running — skipping this tick")
+        return
+    async with _bar_cycle_lock:
+        await _run_bar_close_cycle_locked()
+
+
+async def _run_bar_close_cycle_locked() -> None:
     cfg = get_config()
     symbols = cfg.universe_symbols
 
+    async with session() as s:
+        settings = await repo.get_settings(s)
+        last_seen = int(getattr(settings, "last_bar_seen_ms", 0) or 0)
+
     latest_ms = await _latest_bar_close_ms(symbols)
-    if latest_ms <= _last_bar_seen_ms:
+    if latest_ms <= last_seen:
         log.debug("No new closed 1h bar yet — skipping")
         return
-    _last_bar_seen_ms = latest_ms
+
+    # Persist *before* the heavy LLM call so a crash mid-cycle doesn't replay
+    # the same bar on restart.
+    async with session() as s:
+        await repo.update_setting(s, last_bar_seen_ms=latest_ms)
 
     universe_ohlcv = await _fetch_universe_ohlcv(symbols, cfg.ohlcv_history_bars)
     if not universe_ohlcv:
@@ -206,6 +232,33 @@ async def _apply_decision(
                 raw_response=raw_response,
             )
             return
+        # Autotrade gate covers CLOSE too — dry-run mode means *no* automated
+        # order activity, including exits. Operator must close manually.
+        if not settings.autotrade_enabled:
+            log.info("Autotrade disabled — skipping AI CLOSE %s", td.symbol)
+            await _audit(
+                decision_type="PORTFOLIO",
+                td=td,
+                position_id=existing_pos.id,
+                raw_response=raw_response,
+            )
+            return
+        # Confidence gate also applies to closes — a low-conviction "maybe
+        # close" shouldn't kick out a position the user is still holding.
+        if td.confidence < settings.ai_min_confidence:
+            log.info(
+                "AI CLOSE %s confidence %d < min %d — holding",
+                td.symbol,
+                td.confidence,
+                settings.ai_min_confidence,
+            )
+            await _audit(
+                decision_type="PORTFOLIO",
+                td=td,
+                position_id=existing_pos.id,
+                raw_response=raw_response,
+            )
+            return
         dec_id = await _audit(
             decision_type="PORTFOLIO",
             td=td,
@@ -240,6 +293,22 @@ async def _apply_decision(
 
     if not settings.autotrade_enabled:
         log.info("Autotrade disabled — skipping %s %s", td.action, td.symbol)
+        await _audit(
+            decision_type="PORTFOLIO",
+            td=td,
+            position_id=None,
+            raw_response=raw_response,
+        )
+        return
+
+    if td.confidence < settings.ai_min_confidence:
+        log.info(
+            "AI %s %s confidence %d < min %d — skipping",
+            td.action,
+            td.symbol,
+            td.confidence,
+            settings.ai_min_confidence,
+        )
         await _audit(
             decision_type="PORTFOLIO",
             td=td,
@@ -321,6 +390,29 @@ async def _apply_decision(
         )
         return
 
+    # Liquidation-distance sanity check. Liquidation sits roughly at
+    # 100/leverage % from entry (ignoring maintenance margin). If the SL is
+    # placed beyond that, the position liquidates before the stop ever
+    # triggers — converting a "controlled loss" into a wipeout.
+    sl_dist_pct = abs(last_close - td.sl_price) / last_close * Decimal("100")
+    liq_dist_pct = Decimal("100") / Decimal(lev)
+    min_safe_sl_pct = liq_dist_pct * Decimal("0.9")  # 10% buffer for maint. margin
+    if sl_dist_pct >= min_safe_sl_pct:
+        log.warning(
+            "SL beyond liquidation for %s (sl_dist=%.2f%% lev=%dx liq≈%.2f%%) — skipping",
+            td.symbol,
+            float(sl_dist_pct),
+            lev,
+            float(liq_dist_pct),
+        )
+        await _audit(
+            decision_type="PORTFOLIO",
+            td=td,
+            position_id=None,
+            raw_response=raw_response,
+        )
+        return
+
     dec_id = await _audit(
         decision_type="PORTFOLIO",
         td=td,
@@ -393,8 +485,17 @@ async def _audit(
 
 
 async def run_exit_poll_cycle() -> None:
+    if _exit_cycle_lock.locked():
+        log.info("Exit-poll cycle already running — skipping this tick")
+        return
+    async with _exit_cycle_lock:
+        await _run_exit_poll_cycle_locked()
+
+
+async def _run_exit_poll_cycle_locked() -> None:
     cfg = get_config()
     async with session() as s:
+        settings = await repo.get_settings(s)
         open_positions_db = await repo.open_positions(s)
     if not open_positions_db:
         return
@@ -448,19 +549,34 @@ async def run_exit_poll_cycle() -> None:
             raw_response=raw_response,
         )
 
-        if item.action == "CLOSE":
-            price = latest_prices.get(pos.symbol, pos.entry_price)
-            await bus.publish(
-                ExitSignal(
-                    symbol=pos.symbol,
-                    position_id=pos.id,
-                    reason="AI_EXIT",
-                    price=price,
-                    decision_id=dec_id,
-                )
+        if item.action != "CLOSE":
+            continue
+
+        if not settings.autotrade_enabled:
+            log.info("Autotrade disabled — skipping exit-monitor CLOSE %s", pos.symbol)
+            continue
+
+        if item.confidence < settings.ai_min_confidence:
+            log.info(
+                "Exit-monitor CLOSE %s confidence %d < min %d — holding",
+                pos.symbol,
+                item.confidence,
+                settings.ai_min_confidence,
             )
-            # The final close confirmation (with PnL) is sent by
-            # executor._handle_exit via notify_position_closed.
+            continue
+
+        price = latest_prices.get(pos.symbol, pos.entry_price)
+        await bus.publish(
+            ExitSignal(
+                symbol=pos.symbol,
+                position_id=pos.id,
+                reason="AI_EXIT",
+                price=price,
+                decision_id=dec_id,
+            )
+        )
+        # The final close confirmation (with PnL) is sent by
+        # executor._handle_exit via notify_position_closed.
 
     _ = cfg  # silence
 
