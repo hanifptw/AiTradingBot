@@ -4,20 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Telegram-controlled crypto trading bot for **Binance Futures USDT-M**. Monitors top 20 cryptocurrencies by market cap (excluding stablecoins), executes long/short positions based on a **two-stage Stochastic oscillator signal**, and uses **OpenRouter LLM** to evaluate trading performance.
+Telegram-controlled crypto trading bot for **Binance Futures USDT-M**. Trades a fixed universe of perpetuals; **all open/close/sizing/leverage/SL/TP decisions are made by an LLM** (default Grok 4.20 via OpenRouter) on each 1h bar close, with an exit-monitor poll between bars. A separate evaluator model (Sonnet 4.5) reviews closed trades daily.
 
-Status: greenfield — code not yet written. Implementation plan lives at `/Users/hanifptw/.claude/plans/halo-claude-saya-ingin-abstract-castle.md`.
+The bot supports both Binance Futures testnet and live endpoints. Switching between them requires different API key pairs in `.env` and a process restart.
 
 ## Stack
 
 - Python 3.11+
 - `python-binance` (async) — Futures USDT-M client
 - `python-telegram-bot` v21 (async)
-- `APScheduler` (async) — kline polling, weekly AI job, trailing stop loop
-- `SQLAlchemy` + SQLite — persistence
-- `pandas` — OHLCV frames; Stochastic is hand-rolled (no `pandas-ta`, which doesn't support Python 3.11)
-- `httpx` — CoinGecko + OpenRouter HTTP
-- `pydantic` — config & DTOs
+- `APScheduler` (async) — bar-close cycle, exit-monitor poll, daily AI report, position sync
+- `SQLAlchemy` 2.x + SQLite (WAL mode) — persistence
+- `pandas` — OHLCV frames for prompt building
+- `httpx` — OpenRouter HTTP
+- `pydantic` v2 + `pydantic-settings` — config & DTOs
 - Package manager: `uv` (preferred) or `poetry`
 
 ## Commands
@@ -31,7 +31,7 @@ uv run python -m src.main
 
 # Run tests
 uv run pytest                        # all
-uv run pytest tests/test_stochastic.py::test_two_stage -q   # single test
+uv run pytest tests/test_config.py -q   # single test file
 
 # Lint / format
 uv run ruff check src tests
@@ -40,126 +40,137 @@ uv run ruff format src tests
 
 ## Environment Variables (.env)
 
+All secret-bearing vars below are required — `AppConfig` fails fast at boot if any are missing (see `src/config.py::_require_secrets`).
+
 ```
-MODE=testnet                         # testnet | live
+MODE=testnet                                          # testnet | live (needs matching key pair below)
 BINANCE_API_KEY=...
 BINANCE_API_SECRET=...
 TELEGRAM_BOT_TOKEN=...
-TELEGRAM_ALLOWED_USER_IDS=12345,67890
+TELEGRAM_ALLOWED_USER_IDS=12345,67890                 # comma-separated, auth whitelist
 OPENROUTER_API_KEY=...
-OPENROUTER_MODEL=anthropic/claude-sonnet-4.5            # weekly evaluator (deep)
-OPENROUTER_DECISION_MODEL=anthropic/claude-haiku-4.5    # entry filter + early exit (cheap+fast)
-COINGECKO_API_KEY=                   # optional, free tier works
+OPENROUTER_MODEL=anthropic/claude-sonnet-4.5          # daily evaluator (deep)
+OPENROUTER_DECISION_MODEL=x-ai/grok-4.20              # live trader (bar-close + exit monitor)
 DB_PATH=./data/bot.db
 LOG_LEVEL=INFO
+TIMEZONE=Asia/Jakarta                                 # APScheduler local TZ (display only; jobs run on UTC cron)
 ```
 
 ## Module Layout
 
 ```
 src/
-├── main.py              entrypoint: start scheduler + Telegram + workers
-├── config.py            load .env, validate, expose AppConfig
-├── core/                models, db, repository, in-process event bus
-├── market/              CoinGecko universe + Binance kline/account/order client
-├── indicators/          stochastic.py (%K, %D)
-├── strategy/            state machine, signal engine, risk/sizing
-├── execution/           live_executor, (optional) paper_executor, trailing stop
-├── tgbot/               bot + handlers (menu, balance, positions, pnl, monitor, settings, ai_analysis)
-│                        — named `tgbot` (not `telegram`) so it doesn't shadow the python-telegram-bot package
-├── ai/                  openrouter_client, prompts, evaluator, weekly scheduler
-└── scheduler/           APScheduler runner + jobs (kline poll, universe refresh, trailing, AI weekly)
+├── main.py              entrypoint: init DB, build Telegram app, init binance, wire notifier,
+│                        run startup reconcile, start scheduler, start polling, start executor
+├── config.py            pydantic AppConfig from .env; fail-fast on missing secrets
+├── core/                models, db (WAL + migration shim), repository, event bus
+├── market/              binance_client (single thin async wrapper around python-binance)
+├── strategy/            portfolio_agent (the brain), risk (sizing helper)
+├── execution/           executor — only module placing real orders; idempotent PENDING→OPEN flow
+├── tgbot/               bot + handlers (menu, balance, positions, pnl, monitor, settings,
+│                        ai_analysis, history). Named `tgbot` to avoid shadowing python-telegram-bot.
+├── ai/                  openrouter_client, prompts, portfolio_decision (live trader),
+│                        exit_monitor (between bars), evaluator (daily Sonnet review)
+└── scheduler/           APScheduler runner (cron + intervals) + jobs
 ```
 
 ## Architecture (Big Picture)
 
-The bot is split into **independent modules communicating via an in-process event bus** (`src/core/events.py`). This keeps strategy, execution, and Telegram decoupled — swapping `live_executor` for `paper_executor` is a one-line change.
+The bot is split into **independent modules communicating via an in-process event bus** (`src/core/events.py`). Strategy publishes `EntrySignal`/`ExitSignal`; the executor consumes them. Telegram is decoupled and only reads/writes DB.
 
-**Data flow per tick:**
-1. `scheduler.runner` polls Binance klines for each of the 20 symbols at the configured timeframe.
-2. `indicators.stochastic` computes %K, %D.
-3. `strategy.signal_engine` updates the per-symbol state machine (see below) and emits `EntrySignal` / `ExitSignal` events.
-4. `strategy.risk` validates: max positions, equity % sizing, leverage cap.
-5. `execution.executor` (live) places orders on Binance Futures and persists to DB.
-6. Telegram handlers read DB for UI; settings changes write back and the next tick picks them up.
-7. AI evaluation runs on-demand (Telegram button) or weekly (APScheduler), reads `trades` table, calls OpenRouter, persists report.
+**Per cycle (1h bar close):**
+1. `scheduler.runner` fires `portfolio_bar_close_job` ~10s after bar close (UTC cron).
+2. `strategy.portfolio_agent.run_bar_close_cycle` fetches OHLCV for the universe + open positions, builds a single prompt, calls `OPENROUTER_DECISION_MODEL`.
+3. For each symbol, the model returns `OPEN_LONG`/`OPEN_SHORT`/`CLOSE`/`HOLD` plus full trade params (size %, lev, SL, TP, confidence).
+4. `_apply_decision` clamps against `max_leverage_cap` / `max_equity_per_trade_pct`, gates on `autotrade_enabled` + `ai_min_confidence`, runs a liquidation-distance sanity check, then publishes `EntrySignal`/`ExitSignal`.
+5. `execution.executor` consumes events serialized by a per-symbol `asyncio.Lock`. Entry flow: pre-record `Position(status=PENDING)`, MARKET (with `newClientOrderId`), SL, TP, finalize to OPEN. If SL or TP fails, market-close the just-opened position and mark CANCELLED.
+6. Between bars, `exit_monitor_job` (interval = `settings.exit_poll_minutes`) re-evaluates open positions only and may publish `ExitSignal`.
 
-## Signal State Machine (Critical Logic)
+**Other scheduler jobs:**
+- `sync_positions` (every 2 min): reconciles DB-OPEN positions against Binance — detects SL/TP/liquidation fills the bot didn't observe.
+- `daily_ai_report` (00:05 UTC): runs `ai/evaluator.py` against the last 24h of closed trades using `OPENROUTER_MODEL` (Sonnet).
 
-This is the **non-obvious core**. Per symbol, persist state in `signal_states`:
+## Startup ordering (matters)
 
-- `IDLE` → no actionable condition.
-- `LONG_ARMED` → %K just **crossed up through %D while both <20**. Set on the bar where the cross happened.
-- `SHORT_ARMED` → %K just **crossed down through %D while both >80**.
-- Transition `LONG_ARMED → ENTER_LONG` only when **%K closes above 20** on a subsequent bar. Mirror for short: `SHORT_ARMED → ENTER_SHORT` when **%K closes below 80**.
-- Reset `LONG_ARMED → IDLE` if %K drops back below the prior low without breakout (invalidation). Mirror for short.
-- After entry: state becomes `IN_LONG` / `IN_SHORT`. Exit (TP) fires when **%K crosses %D in the opposite direction** (long: %K crosses below %D; short: %K crosses above %D). SL is a separate Binance `STOP_MARKET` reduce-only order.
+`amain()` in `src/main.py`:
+1. `init_db()` — WAL pragmas, schema, idempotent ADD COLUMN migrations, sync `settings.mode` with `cfg.mode`.
+2. Build Telegram `Application`, `await app.initialize()` so the bot's HTTP client is ready.
+3. `notifier.set_bot(...)` — **before** anything that can publish notifications.
+4. Warm `binance.exchange_info()` (cached 6h), validate universe symbols.
+5. `reconcile_pending_positions()` — adopt or cancel any `PENDING` Position rows left by a crash mid-entry.
+6. Build + start scheduler. (Exposes `_scheduler` for runtime rescheduling.)
+7. `tg_run(app)` — start polling for inbound messages.
+8. `run_executor()` task on the event bus.
 
-Why this is non-obvious: "stochastic crossing" can mean %K-vs-%D OR %K-vs-level. Here we use BOTH at different stages — %K/%D cross arms the signal, level breakout (20/80) triggers entry, %K/%D opposite cross triggers TP.
+Shutdown waits in-flight scheduler jobs to drain before closing the Binance client.
 
 ## Telegram Menu
 
-Inline keyboard: **Saldo · Posisi · PNL · Monitor Coin · Setting · AI Analysis**
+Inline keyboard: **Saldo · Posisi · PNL · Monitor Coin · History · Setting · AI Analysis**
 
-`Setting` exposes (all runtime-configurable, persisted in `settings` table):
-- Timeframe (1m, 5m, 15m, 1h, 4h)
-- SL %
-- Trailing stop toggle + offset
-- Leverage (default 5x)
-- Equity % per trade
-- Max concurrent positions (default 5)
-- Stochastic params (K, D, smooth)
-- AI Entry Filter toggle (default ON) — AI pre-trade gate
-- AI Early Exit toggle (default ON) — AI bar-close exit monitor
-- AI min confidence (default 60) — reject entry if AI confidence below this
-- MODE (testnet / live)
+`Setting` exposes:
+- Autotrade toggle (default OFF — dry-run on-ramp; nothing trades until ON, including AI CLOSE)
+- Mode (read-only, .env-set; switching needs different API keys + restart)
+- Max Leverage Cap (default 10)
+- Max Equity per Trade % (default 20)
+- Exit-monitor poll minutes (default 30 — reschedules APScheduler job live on change)
+- AI Min Confidence (default 60 — both entry and CLOSE gate)
 
-Auth: only `TELEGRAM_ALLOWED_USER_IDS` accepted; all other updates dropped silently.
+The AI (Grok 4.20) chooses position size, leverage, SL, TP per trade — these settings are **upper caps** the AI cannot exceed, not parameters the user tunes directly.
 
-Setting changes use slash commands (no conversation handler): `/set <field> <value>`. Field whitelist lives in `src/tgbot/handlers/settings.py::_parse_field`.
+Auth: every handler + callback (including menu router) is gated by `TELEGRAM_ALLOWED_USER_IDS`. Other updates dropped silently. Settings changes use inline-keyboard `+`/`-` buttons (atomic SQL UPDATE; no read-modify-write race).
 
-Important: **autotrade is OFF by default** (`settings.autotrade_enabled`). The bot polls klines and advances state immediately, but won't place orders until you `/set autotrade on`. This is the dry-run on-ramp before flipping to testnet/live execution.
+## AI Decision Layer
 
-## Demo vs Live
+Two LLM calls drive trading. Both publish to `ai_decisions` for audit.
 
-`MODE=testnet` swaps the Binance base URL to `https://testnet.binancefuture.com` and uses testnet API keys. Same code path — no separate executor needed. Trades logged to DB are tagged with the mode.
+- **`portfolio_decision.decide_portfolio`** (bar close) — `OPENROUTER_DECISION_MODEL` decides per-symbol action with full trade params. JSON-only output; any parse/LLM error → no action this cycle.
+- **`exit_monitor.evaluate_open_positions`** (between bars) — same model, restricted to CLOSE/HOLD on currently-open positions. JSON-only; parse error → hold everything.
 
-## AI Evaluation
+Fail-safe: every parse path returns `(None, raw)` on error. The agent treats `None` as "no action".
 
-`ai/evaluator.py` builds a structured summary (last N closed trades, win rate, avg R, current settings) and sends it to OpenRouter (model = `OPENROUTER_MODEL`, default Sonnet 4.5). The prompt asks for: (1) pattern detection in losing trades, (2) parameter tuning suggestions, (3) discipline/risk observations. Reports stored in `ai_reports`. Triggered on-demand from Telegram and via a weekly APScheduler cron.
-
-## AI Decision Layer (Entry Filter + Early Exit)
-
-Two real-time AI gates wrap the Stochastic strategy. Both call `OPENROUTER_DECISION_MODEL` (default `anthropic/claude-haiku-4.5` — cheap, fast, enough reasoning for TA multi-faktor). Sonnet 4.5 stays reserved for the weekly evaluator.
-
-- **Entry filter** (`ai/decision.py::confirm_entry`) — on every `EntrySignal`, before `set_leverage` in `execution/executor.py::_handle_entry`. AI evaluates market structure (HH/HL vs LH/LL), momentum alignment, supply/demand proximity to entry, and R:R viability. Returns JSON `{approve, confidence, reason, concerns}`. Rejected if `approve=false` OR `confidence < settings.ai_min_confidence`. Rejections logged to `ai_decisions` + Telegram notify.
-- **Early exit** (`ai/decision.py::should_exit_early`) — runs inside the kline poll job (`scheduler/jobs.py::_process`), once per bar close per symbol that has an open position. Reuses the kline DataFrame already fetched — **no extra Binance HTTP**. AI looks for (a) trend reversal against position, (b) decent profit + reversal forming. Returns JSON `{exit, confidence, reason}`. If `exit=true`, publishes `ExitSignal(reason="AI_EARLY_EXIT")` which `_handle_exit` consumes like any other exit.
-
-Fail-safe: any LLM/parse error → entry rejected, exit held.
-
-All AI decisions persist to `ai_decisions` (decision_type, action, confidence, reason, model, raw_response, position_id) for audit. The two settings toggles `ai_entry_filter_enabled` / `ai_early_exit_enabled` default ON; flip from the Telegram Setting menu.
+OpenRouter retries only on 5xx / transport errors — never on 4xx (bad key, bad payload would just multiply cost).
 
 ## Database (SQLite via SQLAlchemy)
 
-- `settings` (singleton) — runtime config controlled by Telegram (incl. AI toggles)
-- `monitored_symbols` — current top 20, cached market-cap rank
-- `signal_states` — per-symbol state machine snapshot
-- `positions` — open + closed positions
-- `orders` — raw Binance order log
+- `settings` (singleton id=1) — runtime config controlled by Telegram + `last_bar_seen_ms` (persisted dedupe)
+- `positions` — OPEN / PENDING / CLOSED / CANCELLED, with `client_order_id` for crash-recovery reconcile
+- `orders` — Binance order log (whitelisted fields only, see `executor.sanitize_order_resp`)
 - `trades` — closed-trade summary (entry, exit, PnL, R-multiple, mode tag)
-- `ai_reports` — weekly/on-demand AI evaluation history (markdown, model used)
-- `ai_decisions` — per-call audit log for entry filter + early-exit decisions
+- `ai_reports` — daily/on-demand AI evaluation history (markdown, model used)
+- `ai_decisions` — per-call audit log for portfolio + exit-monitor decisions
 
 ## Conventions
 
 - All I/O is `async` (Binance, Telegram, OpenRouter, SQLAlchemy async session).
 - Money values: use `Decimal`, never `float`.
-- Time: store UTC in DB; format to local only at Telegram display layer.
-- Never log API keys or full order payloads at INFO level.
+- Time: store UTC in DB; format to local only at Telegram display layer. Always use `datetime.now(UTC)`, never `datetime.utcnow()` (deprecated + naive).
+- Never log API keys or full order payloads at INFO level. Use `sanitize_order_resp()` from `src/execution/executor.py` before persisting any Binance order response.
+
+## Schema migrations (no Alembic — yet)
+
+We do **not** have Alembic. New columns are added via a small idempotent shim:
+
+1. Add the column to the model in `src/core/models.py`.
+2. Append an entry to the `desired` dict in `src/core/db.py::_migrate_sqlite_add_columns`, e.g.
+   `"settings": [("new_field", "INTEGER NOT NULL DEFAULT 0")]`.
+3. Restart the bot — `init_db()` will `ALTER TABLE ADD COLUMN` if missing, no-op if present.
+
+Limitations: this only handles **ADD COLUMN**. Renames, drops, type changes, or new constraints need either a manual SQL migration step or a real Alembic setup. If a model change is more invasive than ADD COLUMN, stop and ask before pushing — production has live trade history.
+
+## Session/commit semantics
+
+`src/core/repository.py` functions commit inside the session (`await s.commit()` before return). This means:
+
+- The `async with session() as s:` context manager does **not** roll back on exception once a repo function has committed — partial state is already persisted.
+- Callers should treat each repo call as its own atomic unit.
+- Multi-step writes that must be all-or-nothing belong inside a single repo function so they share one `commit()`.
+- For atomic read-modify-write on a single column (e.g. settings increments), use `repo.adjust_setting()` which expresses the operation as a single SQL UPDATE — never read-then-write in Python.
 
 ## Not in scope (yet)
 
 - Multi-user / multi-account
 - Backtesting framework
 - Web dashboard
-- Indicators other than Stochastic
+- Alembic migrations (we use a manual ADD-COLUMN shim — see above)
+- Switching testnet↔live at runtime (different API key pairs, restart-only)
