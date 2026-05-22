@@ -30,9 +30,13 @@ async def show_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = await update.effective_message.reply_text("🤖 Generating AI analysis…")
         try:
             report = await generate_report(trigger="on_demand")
-        except Exception:
+        except Exception as exc:
             log.exception("AI analysis failed")
-            await msg.edit_text("❌ AI analysis failed — cek log.")
+            err_summary = str(exc)[:300]
+            await msg.edit_text(
+                f"❌ AI analysis gagal\n`{type(exc).__name__}: {err_summary}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
             return
         text = (
             f"🤖 *AI Analysis* (model `{report.model}`, {report.trades_count} trades)\n\n"

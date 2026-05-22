@@ -3,8 +3,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from src.core.models import AIDecision, Position, Trade
+
+_WIB = ZoneInfo("Asia/Jakarta")
+
+
+def _to_wib(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(_WIB)
 
 
 def fmt_balance(wallet: Decimal, available: Decimal, mode: str) -> str:
@@ -146,7 +155,7 @@ def fmt_monitor(symbols: list[str], latest: dict[str, AIDecision]) -> str:
             lines.append(f"⚪ `{sym}`  — `no decision yet`")
             continue
         badge = _ACTION_BADGE.get(d.action, "⚪")
-        ts = d.created_at.strftime("%m-%d %H:%M") if d.created_at else "?"
+        ts = _to_wib(d.created_at).strftime("%m-%d %H:%M WIB") if d.created_at else "?"
         conf = f" conf=`{d.confidence}%`" if d.confidence is not None else ""
         reason = (d.reason or "").strip()
         reason_str = f"\n  _{reason[:120]}_" if reason else ""
@@ -157,9 +166,9 @@ def fmt_monitor(symbols: list[str], latest: dict[str, AIDecision]) -> str:
 def fmt_trade_row(t: Trade) -> str:
     return (
         f"`{t.symbol}` {t.side} pnl=`{t.pnl_usdt:+.2f}` ({t.pnl_pct:+.2f}%) "
-        f"reason=`{t.close_reason}` @{t.closed_at:%Y-%m-%d %H:%M}"
+        f"reason=`{t.close_reason}` @{_to_wib(t.closed_at).strftime('%Y-%m-%d %H:%M')} WIB"
     )
 
 
 def fmt_dt(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M UTC")
+    return _to_wib(dt).strftime("%Y-%m-%d %H:%M WIB")
