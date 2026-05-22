@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pandas as pd
+
+from src.ai import prompts as P
 from src.ai.portfolio_decision import parse_response
 
 
@@ -69,3 +72,68 @@ def test_confidence_negative_clamped():
     decision = parse_response(raw)
     assert decision is not None
     assert decision.decisions[0].confidence == 0
+
+
+def _dummy_ohlcv() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "close_time": pd.to_datetime(["2026-05-22T00:00Z", "2026-05-22T01:00Z"], utc=True),
+            "open": [100.0, 101.0],
+            "high": [102.0, 103.0],
+            "low": [99.0, 100.0],
+            "close": [101.0, 102.0],
+            "volume": [10.0, 12.0],
+        }
+    )
+
+
+def test_portfolio_prompt_embeds_historical_context():
+    sentinel = "## Historical context (last 7d) — UNIQUE-SENTINEL-12345"
+    prompt = P.build_portfolio_user_prompt(
+        balance_usdt=Decimal("1000"),
+        open_positions=[],
+        universe_ohlcv={"BTCUSDT": _dummy_ohlcv()},
+        ohlcv_history_bars=2,
+        max_leverage_cap=10,
+        max_equity_per_trade_pct=Decimal("20"),
+        historical_context=sentinel,
+    )
+    assert sentinel in prompt
+    # Caps appear before the historical block; OHLCV after.
+    assert prompt.index("max leverage") < prompt.index(sentinel) < prompt.index("BTCUSDT")
+
+
+def test_portfolio_prompt_omits_block_when_no_history():
+    prompt = P.build_portfolio_user_prompt(
+        balance_usdt=Decimal("1000"),
+        open_positions=[],
+        universe_ohlcv={"BTCUSDT": _dummy_ohlcv()},
+        ohlcv_history_bars=2,
+        max_leverage_cap=10,
+        max_equity_per_trade_pct=Decimal("20"),
+        historical_context=None,
+    )
+    assert "Historical context" not in prompt
+
+
+def test_exit_monitor_prompt_embeds_historical_context():
+    sentinel = "## Historical context (last 7d) — UNIQUE-SENTINEL-67890"
+    prompt = P.build_exit_monitor_user_prompt(
+        open_positions=[
+            {
+                "id": 1,
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "qty": "0.1",
+                "entry_price": "100",
+                "leverage": 5,
+                "upnl_pct": 1.0,
+                "bars_open": 3,
+            }
+        ],
+        recent_ohlcv={"BTCUSDT": _dummy_ohlcv()},
+        latest_prices={"BTCUSDT": Decimal("102")},
+        historical_context=sentinel,
+    )
+    assert sentinel in prompt
+    assert prompt.index(sentinel) < prompt.index("## Open positions")

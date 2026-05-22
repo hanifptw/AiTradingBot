@@ -15,17 +15,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pandas as pd
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.ai import exit_monitor, portfolio_decision
+from src.ai import prompts as P
 from src.config import get_config
 from src.core import repository as repo
 from src.core.db import session
 from src.core.events import EntrySignal, ExitSignal, get_bus
-from src.core.models import AIDecision, Position, Side
+from src.core.models import AIDecision, Position, Side, Trade
 from src.market.binance_client import get_binance
 from src.tgbot.notifier import notify
 
@@ -90,6 +92,52 @@ async def _account_balance() -> Decimal:
         return Decimal("0")
 
 
+def _trade_to_history_dict(t: Trade) -> dict:
+    """Compact serialization for the worst-trades list in the historical block."""
+    return {
+        "symbol": t.symbol,
+        "side": t.side,
+        "entry_price": f"{float(t.entry_price):.6g}",
+        "exit_price": f"{float(t.exit_price):.6g}",
+        "r_multiple": t.r_multiple,
+        "close_reason": t.close_reason,
+    }
+
+
+async def _build_historical_context(s: AsyncSession) -> str | None:
+    """Render the 7-day historical context block for trading prompts.
+
+    Returns None when there is nothing useful to surface (no trades AND no
+    evaluator report) — caller passes None through to the prompt builder,
+    which skips the block entirely.
+    """
+    since = datetime.now(UTC) - timedelta(days=7)
+    trades = await repo.trades_since(s, since)
+    report = await repo.last_ai_report(s)
+
+    stats = repo.aggregate_trade_stats(trades) if trades else None
+    per_sym = repo.per_symbol_stats(trades) if trades else []
+    worst = [_trade_to_history_dict(t) for t in repo.worst_trades(trades, limit=5)]
+
+    age_h: float | None = None
+    md: str | None = None
+    if report is not None:
+        created = report.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        age_h = (datetime.now(UTC) - created).total_seconds() / 3600
+        md = report.report_md
+
+    return P.format_historical_context(
+        trades_count=len(trades),
+        stats=stats,
+        per_symbol=per_sym,
+        worst=worst,
+        last_report_md=md,
+        last_report_age_hours=age_h,
+    )
+
+
 async def _latest_bar_close_ms(symbols: list[str]) -> int:
     binance = get_binance()
     latest = 0
@@ -145,6 +193,7 @@ async def _run_bar_close_cycle_locked() -> None:
     async with session() as s:
         settings = await repo.get_settings(s)
         open_positions_db = await repo.open_positions(s)
+        historical_ctx = await _build_historical_context(s)
 
     # Map mark prices to compute unrealized PnL for the prompt.
     mark_prices: dict[str, Decimal] = {}
@@ -164,6 +213,7 @@ async def _run_bar_close_cycle_locked() -> None:
         max_leverage_cap=settings.max_leverage_cap,
         max_equity_per_trade_pct=settings.max_equity_per_trade_pct,
         ohlcv_history_bars=cfg.ohlcv_history_bars,
+        historical_context=historical_ctx,
     )
 
     if decision is None:
@@ -497,6 +547,7 @@ async def _run_exit_poll_cycle_locked() -> None:
     async with session() as s:
         settings = await repo.get_settings(s)
         open_positions_db = await repo.open_positions(s)
+        historical_ctx = await _build_historical_context(s) if open_positions_db else None
     if not open_positions_db:
         return
 
@@ -523,6 +574,7 @@ async def _run_exit_poll_cycle_locked() -> None:
         open_positions=pos_views,
         latest_prices=latest_prices,
         recent_ohlcv=recent_ohlcv,
+        historical_context=historical_ctx,
     )
     if decision is None:
         log.warning("Exit-monitor parse/LLM error — holding all positions")

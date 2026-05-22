@@ -98,6 +98,7 @@ async def decide_portfolio(
     max_leverage_cap: int,
     max_equity_per_trade_pct: Decimal,
     ohlcv_history_bars: int,
+    historical_context: str | None = None,
 ) -> tuple[PortfolioDecision | None, str]:
     """Return (decision, raw_response). Caller persists raw_response for audit."""
     cfg = get_config()
@@ -108,7 +109,11 @@ async def decide_portfolio(
         ohlcv_history_bars=ohlcv_history_bars,
         max_leverage_cap=max_leverage_cap,
         max_equity_per_trade_pct=max_equity_per_trade_pct,
+        historical_context=historical_context,
     )
+
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("Portfolio user prompt (truncated): %s", user_prompt[:2000])
 
     raw = ""
     try:

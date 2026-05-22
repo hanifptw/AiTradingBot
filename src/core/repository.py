@@ -253,6 +253,73 @@ def windows(now: datetime) -> dict[str, datetime]:
     }
 
 
+# --- Historical aggregators (for prompt context injection) ------------------
+
+
+def aggregate_trade_stats(trades: list[Trade]) -> dict:
+    """Pure-Python aggregate over a Trade list. Used to build the historical
+    context block injected into trading prompts."""
+    if not trades:
+        return {
+            "count": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "total_pnl_usdt": Decimal("0"),
+            "avg_r": None,
+            "best_r": None,
+            "worst_r": None,
+        }
+    total = sum((t.pnl_usdt for t in trades), Decimal("0"))
+    wins = sum(1 for t in trades if t.pnl_usdt > 0)
+    losses = len(trades) - wins
+    rs = [float(t.r_multiple) for t in trades if t.r_multiple is not None]
+    avg_r = sum(rs) / len(rs) if rs else None
+    return {
+        "count": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": (wins / len(trades)) * 100,
+        "total_pnl_usdt": total,
+        "avg_r": avg_r,
+        "best_r": max(rs) if rs else None,
+        "worst_r": min(rs) if rs else None,
+    }
+
+
+def per_symbol_stats(trades: list[Trade]) -> list[dict]:
+    """Group trades by symbol; sort worst-first by total PnL. Skips symbols
+    with zero trades (caller passes the window-filtered list)."""
+    buckets: dict[str, list[Trade]] = {}
+    for t in trades:
+        buckets.setdefault(t.symbol, []).append(t)
+    rows: list[dict] = []
+    for sym, group in buckets.items():
+        total = sum((t.pnl_usdt for t in group), Decimal("0"))
+        wins = sum(1 for t in group if t.pnl_usdt > 0)
+        rs = [float(t.r_multiple) for t in group if t.r_multiple is not None]
+        rows.append(
+            {
+                "symbol": sym,
+                "count": len(group),
+                "wins": wins,
+                "win_rate": (wins / len(group)) * 100,
+                "total_pnl": total,
+                "avg_r": (sum(rs) / len(rs)) if rs else None,
+            }
+        )
+    rows.sort(key=lambda r: r["total_pnl"])
+    return rows
+
+
+def worst_trades(trades: list[Trade], limit: int = 5) -> list[Trade]:
+    """Top N trades by ascending R-multiple. Trades without an R-multiple
+    (no SL set) are excluded — they're not comparable on this axis."""
+    scored = [t for t in trades if t.r_multiple is not None]
+    scored.sort(key=lambda t: float(t.r_multiple))
+    return scored[:limit]
+
+
 # --- AI reports -------------------------------------------------------------
 
 

@@ -85,13 +85,18 @@ async def evaluate_open_positions(
     open_positions: list[dict],
     latest_prices: dict[str, Decimal],
     recent_ohlcv: dict[str, pd.DataFrame],
+    historical_context: str | None = None,
 ) -> tuple[ExitDecision | None, str]:
     cfg = get_config()
     user_prompt = P.build_exit_monitor_user_prompt(
         open_positions=open_positions,
         recent_ohlcv=recent_ohlcv,
         latest_prices=latest_prices,
+        historical_context=historical_context,
     )
+
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("Exit-monitor user prompt (truncated): %s", user_prompt[:2000])
 
     raw = ""
     try:
