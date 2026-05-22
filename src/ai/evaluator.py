@@ -7,7 +7,7 @@ Triggered daily via APScheduler and on-demand via Telegram /ai.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from statistics import mean
 
@@ -37,7 +37,7 @@ def _trade_to_dict(t: Trade) -> dict:
 
 async def generate_report(trigger: str = "on_demand") -> AIReport:
     cfg = get_config()
-    cutoff = datetime.utcnow() - timedelta(days=1)
+    cutoff = datetime.now(UTC) - timedelta(days=1)
     async with session() as s:
         settings = await repo.get_settings(s)
         trades = await repo.trades_since(s, cutoff)

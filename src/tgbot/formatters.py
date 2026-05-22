@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -16,7 +16,8 @@ def _fmt_qty(qty: Decimal) -> str:
 
 
 def _fmt_dur(opened_at: datetime) -> str:
-    delta = datetime.utcnow() - opened_at.replace(tzinfo=None)
+    opened = opened_at if opened_at.tzinfo is not None else opened_at.replace(tzinfo=UTC)
+    delta = datetime.now(UTC) - opened
     h, rem = divmod(int(delta.total_seconds()), 3600)
     m = rem // 60
     if h >= 24:
@@ -35,7 +36,7 @@ def fmt_positions(
 
     db_map = db_map or {}
     funding_data = funding_data or {}
-    now_ms = int(datetime.utcnow().timestamp() * 1000)
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
 
     lines = [f"*Posisi Terbuka* ({len(binance_positions)})"]
     for bd in binance_positions:

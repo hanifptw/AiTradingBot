@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from telegram import Update
@@ -17,7 +17,7 @@ from src.tgbot.formatters import fmt_pnl_windows
 
 @restricted
 async def show_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
     windows = repo.windows(now)
     stats = {}
     async with session() as s:
