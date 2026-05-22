@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
 
-from sqlalchemy import JSON, DateTime, Index, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, DateTime, Index, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -14,8 +14,10 @@ class Side(str, Enum):
 
 
 class PositionStatus(str, Enum):
+    PENDING = "PENDING"  # entry attempt in-flight (MARKET sent, SL/TP not yet confirmed)
     OPEN = "OPEN"
     CLOSED = "CLOSED"
+    CANCELLED = "CANCELLED"  # entry attempt aborted/rolled back before reaching OPEN
 
 
 class CloseReason(str, Enum):
@@ -50,8 +52,15 @@ class Settings(Base):
     # Exit-monitor cadence (minutes). 1h bar-close cycle runs separately.
     exit_poll_minutes: Mapped[int] = mapped_column(Integer, default=30)
 
+    # Reject AI entries (and exit-monitor closes) whose confidence is below this.
+    ai_min_confidence: Mapped[int] = mapped_column(Integer, default=60)
+
+    # Last 1h bar close_time (ms since epoch) processed by the portfolio cycle.
+    # Persisted so a restart doesn't re-trigger the most recent bar.
+    last_bar_seen_ms: Mapped[int] = mapped_column(BigInteger, default=0)
+
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.utcnow()
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -79,8 +88,12 @@ class Position(Base):
     realized_pnl: Mapped[Decimal | None] = mapped_column(Numeric(30, 10), nullable=True)
     close_reason: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # Idempotency token sent to Binance as newClientOrderId on the entry MARKET.
+    # Lets us reconcile orphan positions after a crash mid-entry.
+    client_order_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+
     opened_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.utcnow()
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -98,10 +111,11 @@ class Order(Base):
     qty: Mapped[Decimal] = mapped_column(Numeric(30, 10))
     price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10), nullable=True)
     binance_order_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    client_order_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     status: Mapped[str] = mapped_column(String)
     raw: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.utcnow()
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -141,7 +155,7 @@ class AIReport(Base):
     trades_count: Mapped[int] = mapped_column(Integer)
     report_md: Mapped[str] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.utcnow()
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
 
@@ -168,5 +182,5 @@ class AIDecision(Base):
     tp_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.utcnow()
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
