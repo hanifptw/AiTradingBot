@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -68,6 +68,30 @@ class AppConfig(BaseSettings):
         if isinstance(v, list):
             return [str(x).strip().upper() for x in v if str(x).strip()]
         raise ValueError("universe_symbols must be a comma-separated string or list")
+
+    @model_validator(mode="after")
+    def _require_secrets(self) -> AppConfig:
+        """Fail fast at boot if a required secret is missing.
+
+        Live trading without these will crash the first time a worker tries
+        to use them — much better to refuse to start.
+        """
+        missing: list[str] = []
+        if not self.binance_api_key:
+            missing.append("BINANCE_API_KEY")
+        if not self.binance_api_secret:
+            missing.append("BINANCE_API_SECRET")
+        if not self.telegram_bot_token:
+            missing.append("TELEGRAM_BOT_TOKEN")
+        if not self.telegram_allowed_user_ids:
+            missing.append("TELEGRAM_ALLOWED_USER_IDS")
+        if not self.openrouter_api_key:
+            missing.append("OPENROUTER_API_KEY")
+        if missing:
+            raise ValueError(
+                "Missing required environment variables: " + ", ".join(missing)
+            )
+        return self
 
     @property
     def binance_base_url(self) -> str:

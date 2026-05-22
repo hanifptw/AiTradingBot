@@ -11,6 +11,7 @@ from telegram.ext import (
 )
 
 from src.config import get_config
+from src.tgbot.auth import restricted
 from src.tgbot.handlers import (
     ai_analysis,
     balance,
@@ -25,6 +26,7 @@ from src.tgbot.handlers import (
 log = logging.getLogger(__name__)
 
 
+@restricted
 async def _on_menu_click(update, context):
     """Dispatch inline-button callbacks to the matching handler."""
     query = update.callback_query
@@ -48,6 +50,7 @@ async def _on_menu_click(update, context):
         await fn(update, context)
 
 
+@restricted
 async def _noop(update, context):
     if update.callback_query:
         await update.callback_query.answer()
@@ -79,12 +82,12 @@ def build_app() -> Application:
 
 
 async def run(app: Application) -> None:
-    """Run the Telegram app as part of a larger asyncio event loop.
+    """Start the Telegram app's update polling.
 
-    PTB v21 supports manual initialize/start/stop, which is what we need to
-    cohabit with APScheduler and the event-bus consumers.
+    The caller is expected to have already called `await app.initialize()`
+    (so that `notifier.set_bot` can be wired before any background job
+    publishes via `notify()`).
     """
-    await app.initialize()
     await app.start()
     if app.updater is not None:
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)

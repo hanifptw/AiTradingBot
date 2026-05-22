@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import logging
 from decimal import Decimal
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -10,10 +12,13 @@ from telegram.ext import ContextTypes
 from src.core import repository as repo
 from src.core.db import session
 from src.core.models import Order
+from src.execution.executor import sanitize_order_resp
 from src.market.binance_client import get_binance
 from src.tgbot.auth import restricted
 from src.tgbot.formatters import fmt_positions
 from src.tgbot.notifier import notify
+
+log = logging.getLogger(__name__)
 
 
 def _parse_fill(resp: dict, fallback: Decimal) -> Decimal:
@@ -62,11 +67,15 @@ async def show_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         db_positions = await repo.open_positions(s)
     db_map = {p.symbol: p for p in db_positions}
 
-    # Funding info per symbol.
-    funding_data: dict[str, dict] = {}
-    for bd in binance_positions:
-        with contextlib.suppress(Exception):
-            funding_data[bd["symbol"]] = await binance.mark_price_info(bd["symbol"])
+    # Funding info per symbol — fetched in parallel to avoid N sequential HTTP calls.
+    async def _fetch_mark(sym: str) -> tuple[str, dict]:
+        try:
+            return sym, await binance.mark_price_info(sym)
+        except Exception:
+            return sym, {}
+
+    funding_pairs = await asyncio.gather(*[_fetch_mark(bd["symbol"]) for bd in binance_positions])
+    funding_data: dict[str, dict] = dict(funding_pairs)
 
     # Build Close buttons — one per Binance position.
     keyboard: list[list[InlineKeyboardButton]] = []
@@ -124,8 +133,11 @@ async def handle_close_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 ext_opposite = "SELL" if ext_side == "LONG" else "BUY"
                 try:
                     close_resp = await binance.close_market_order(symbol, ext_opposite, ext_qty)
-                except Exception as e:
-                    await query.edit_message_text(f"❌ Gagal close {symbol}: {e}")
+                except Exception:
+                    log.exception("manual close failed for %s", symbol)
+                    await query.edit_message_text(
+                        f"❌ Gagal close {symbol} — cek log."
+                    )
                     return
                 ext_entry = Decimal(str(bd.get("entryPrice", "0")))
                 ext_exit = await _resolve_fill(binance, close_resp, ext_opposite, symbol, ext_entry)
@@ -154,8 +166,9 @@ async def handle_close_callback(update: Update, context: ContextTypes.DEFAULT_TY
             opposite = "SELL" if pos.side == "LONG" else "BUY"
             try:
                 close_resp = await binance.close_market_order(symbol, opposite, pos.qty)
-            except Exception as e:
-                await query.edit_message_text(f"❌ Gagal close {symbol}: {e}")
+            except Exception:
+                log.exception("manual close failed for %s", symbol)
+                await query.edit_message_text(f"❌ Gagal close {symbol} — cek log.")
                 return
 
             exit_price = await _resolve_fill(binance, close_resp, opposite, symbol, pos.entry_price)
@@ -183,7 +196,7 @@ async def handle_close_callback(update: Update, context: ContextTypes.DEFAULT_TY
                     price=exit_price,
                     binance_order_id=str(close_resp.get("orderId")),
                     status=str(close_resp.get("status", "FILLED")),
-                    raw=close_resp,
+                    raw=sanitize_order_resp(close_resp),
                 ),
             )
             await repo.close_position(

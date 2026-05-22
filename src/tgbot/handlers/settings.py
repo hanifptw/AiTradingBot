@@ -17,6 +17,7 @@ from telegram.ext import ContextTypes
 from src.core import repository as repo
 from src.core.db import session
 from src.core.models import Settings
+from src.scheduler.runner import reschedule_exit_monitor
 from src.tgbot.auth import restricted
 
 
@@ -36,14 +37,18 @@ def settings_keyboard(s: Settings) -> InlineKeyboardMarkup:
     minus_lev, plus_lev = _adj("max_leverage_cap", "1")
     minus_eq, plus_eq = _adj("max_equity_per_trade_pct", "1")
     minus_poll, plus_poll = _adj("exit_poll_minutes", "5")
+    minus_conf, plus_conf = _adj("ai_min_confidence", "5")
 
     autotrade_label = "🟢 Autotrade: ON" if s.autotrade_enabled else "🔴 Autotrade: OFF"
-    mode_label = f"🌐 Mode: {s.mode.upper()}"
+    # Mode is read-only: switching live↔testnet needs different API keys, set
+    # via .env, requires restart. Showing as a noop button prevents the user
+    # from thinking a tap actually changes the endpoint.
+    mode_label = f"🌐 Mode: {s.mode.upper()} (.env)"
 
     return InlineKeyboardMarkup(
         [
             [_b(autotrade_label, "set:toggle:autotrade")],
-            [_b(mode_label, "set:toggle:mode")],
+            [_noop(mode_label)],
             [_noop("⚡ Max Leverage"), minus_lev, _noop(f"{s.max_leverage_cap}x"), plus_lev],
             [
                 _noop("💵 Max Equity/Trade"),
@@ -52,6 +57,12 @@ def settings_keyboard(s: Settings) -> InlineKeyboardMarkup:
                 plus_eq,
             ],
             [_noop("⏱ Exit Poll"), minus_poll, _noop(f"{s.exit_poll_minutes}m"), plus_poll],
+            [
+                _noop("🎯 AI Min Conf"),
+                minus_conf,
+                _noop(f"{s.ai_min_confidence}%"),
+                plus_conf,
+            ],
             [_b("← Menu", "menu:main")],
         ]
     )
@@ -65,6 +76,7 @@ def _settings_text(s: Settings) -> str:
         f"• Max Leverage Cap: `{s.max_leverage_cap}x`\n"
         f"• Max Equity per Trade: `{s.max_equity_per_trade_pct:.0f}%`\n"
         f"• Exit-monitor Poll: `{s.exit_poll_minutes}` menit\n"
+        f"• AI Min Confidence: `{s.ai_min_confidence}%`\n"
         f"\n_AI (Grok 4.20) memutuskan kapan buka/tutup, ukuran posisi, leverage, SL, dan TP. "
         f"Setting di atas adalah batas atas (safety caps) yang AI tidak boleh lewati._"
     )
@@ -121,9 +133,7 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
         elif action == "toggle":
             if arg1 == "autotrade":
                 await repo.update_setting(s, autotrade_enabled=not cfg.autotrade_enabled)
-            elif arg1 == "mode":
-                new_mode = "live" if cfg.mode == "testnet" else "testnet"
-                await repo.update_setting(s, mode=new_mode)
+            # mode toggle removed: testnet/live needs different API keys (.env)
 
         elif action == "adj":
             field, raw_delta = arg1, arg2
@@ -132,17 +142,29 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
             except InvalidOperation:
                 return
 
+            # Atomic clamp+increment via SQL UPDATE — two fast taps can't
+            # race to lose a delta the way a read-modify-write would.
             if field == "max_leverage_cap":
-                new_val = max(1, min(20, int(cfg.max_leverage_cap) + int(delta)))
-                await repo.update_setting(s, max_leverage_cap=new_val)
-            elif field == "exit_poll_minutes":
-                new_val = max(5, min(60, int(cfg.exit_poll_minutes) + int(delta)))
-                await repo.update_setting(s, exit_poll_minutes=new_val)
-            elif field == "max_equity_per_trade_pct":
-                new_val = max(
-                    Decimal("1"), min(Decimal("100"), cfg.max_equity_per_trade_pct + delta)
+                await repo.adjust_setting(
+                    s, "max_leverage_cap", int(delta), min_value=1, max_value=20
                 )
-                await repo.update_setting(s, max_equity_per_trade_pct=new_val)
+            elif field == "exit_poll_minutes":
+                updated = await repo.adjust_setting(
+                    s, "exit_poll_minutes", int(delta), min_value=5, max_value=60
+                )
+                reschedule_exit_monitor(updated.exit_poll_minutes)
+            elif field == "max_equity_per_trade_pct":
+                await repo.adjust_setting(
+                    s,
+                    "max_equity_per_trade_pct",
+                    delta,
+                    min_value=Decimal("1"),
+                    max_value=Decimal("100"),
+                )
+            elif field == "ai_min_confidence":
+                await repo.adjust_setting(
+                    s, "ai_min_confidence", int(delta), min_value=0, max_value=100
+                )
 
         cfg = await repo.get_settings(s)
 
