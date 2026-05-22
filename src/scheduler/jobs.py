@@ -11,9 +11,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from src.ai.evaluator import generate_report
@@ -60,11 +61,15 @@ async def sync_positions() -> None:
         log.exception("sync_positions: failed to fetch Binance positions")
         return
 
+    # When the bot is offline for hours, many positions may have closed at
+    # once. Reconciling in a tight loop can blow past Telegram's 30 msg/sec
+    # bot limit; sleep a beat between iterations.
     for pos in db_open:
         try:
             await _reconcile_one(binance, binance_open, pos)
         except Exception:
             log.exception("sync_positions: reconcile failed for %s", pos.symbol)
+        await asyncio.sleep(0.1)
 
 
 def _classify_close_reason(pos, exit_price: Decimal, pnl: Decimal) -> str:
@@ -106,25 +111,36 @@ async def _reconcile_one(binance, binance_open: dict, pos) -> None:
     )
 
     exit_price = pos.entry_price  # safe fallback
+    fee = Decimal("0")
     try:
         trades = await binance.recent_user_trades(pos.symbol, limit=10)
         close_side = "SELL" if pos.side == "LONG" else "BUY"
+        # Normalize opened_at to UTC: a naive datetime would be reinterpreted
+        # as local-time by .timestamp(), throwing off the Binance trade match.
+        opened_aware = (
+            pos.opened_at
+            if pos.opened_at.tzinfo is not None
+            else pos.opened_at.replace(tzinfo=UTC)
+        )
+        opened_ms = int(opened_aware.timestamp() * 1000)
         candidates = [
             t
             for t in trades
             if t.get("side", "").upper() == close_side
-            and int(t.get("time", 0)) >= int(pos.opened_at.timestamp() * 1000)
+            and int(t.get("time", 0)) >= opened_ms
         ]
         if candidates:
             best = max(candidates, key=lambda t: t.get("time", 0))
             price = Decimal(str(best["price"]))
             if price > 0:
                 exit_price = price
+            # Sum commissions from all closing fills (usually USDT).
+            fee = sum(Decimal(str(t.get("commission", "0"))) for t in candidates)
     except Exception:
         log.exception("sync_positions: could not fetch exit trade for %s", pos.symbol)
 
     direction = Decimal("1") if pos.side == "LONG" else Decimal("-1")
-    pnl = pos.qty * (exit_price - pos.entry_price) * direction
+    pnl = pos.qty * (exit_price - pos.entry_price) * direction - fee
     reason = _classify_close_reason(pos, exit_price, pnl)
 
     db_ok = False
@@ -161,7 +177,7 @@ async def _reconcile_one(binance, binance_open: dict, pos) -> None:
 
 async def daily_ai_report() -> None:
     try:
-        log.info("Running daily AI report at %s", datetime.utcnow().isoformat())
+        log.info("Running daily AI report at %s", datetime.now(UTC).isoformat())
         await generate_report(trigger="daily")
     except Exception:
         log.exception("Daily AI report failed")
@@ -182,3 +198,79 @@ async def validate_universe_on_startup() -> None:
     if missing:
         log.error("Configured universe symbols not listed on Binance Futures: %s", missing)
         await notify(f"⚠️ Symbol tidak ditemukan di Binance Futures USDT-M: `{', '.join(missing)}`")
+
+
+async def reconcile_pending_positions() -> None:
+    """One-shot at startup: resolve Position rows left in PENDING state.
+
+    A PENDING row means the executor crashed/was killed between the MARKET
+    fill on Binance and updating the row to OPEN. We cross-reference Binance:
+      - If a matching position exists → adopt it (status → OPEN).
+      - If no position exists → the entry never filled, mark CANCELLED.
+    """
+    binance = get_binance()
+    async with session() as s:
+        pending = await repo.pending_positions(s)
+    if not pending:
+        return
+
+    log.warning("Reconciling %d PENDING position(s) from prior run", len(pending))
+
+    try:
+        binance_open = await binance.open_position_amounts()
+    except Exception:
+        log.exception("reconcile_pending_positions: failed to fetch Binance positions")
+        return
+
+    for pos in pending:
+        try:
+            await _reconcile_pending_one(binance, binance_open, pos)
+        except Exception:
+            log.exception("reconcile_pending_positions: failed for %s", pos.symbol)
+
+
+async def _reconcile_pending_one(binance, binance_open: dict, pos) -> None:
+    amt = binance_open.get(pos.symbol, Decimal("0"))
+    side_matches = (pos.side == "LONG" and amt > 0) or (pos.side == "SHORT" and amt < 0)
+
+    if not side_matches or amt == 0:
+        log.warning(
+            "PENDING %s %s (id=%d coid=%s): no matching Binance position — marking CANCELLED",
+            pos.side,
+            pos.symbol,
+            pos.id,
+            pos.client_order_id,
+        )
+        async with session() as s:
+            await repo.mark_position_cancelled(s, pos.id, "RECONCILE_NO_BINANCE_POS")
+        await notify(
+            f"🔧 *{pos.symbol}* PENDING entry tidak ada di Binance — di-cancel."
+        )
+        return
+
+    log.warning(
+        "PENDING %s %s (id=%d coid=%s): Binance position exists (amt=%s) — adopting as OPEN",
+        pos.side,
+        pos.symbol,
+        pos.id,
+        pos.client_order_id,
+        amt,
+    )
+    # We don't know the real fill price or whether SL/TP made it. Take qty
+    # from Binance, leave SL/TP order ids as None — sync_positions will close
+    # via heuristic if Binance closes the position later.
+    real_qty = abs(amt)
+    async with session() as s:
+        await repo.finalize_pending_position(
+            s,
+            pos.id,
+            qty=real_qty,
+            entry_price=pos.entry_price,  # best estimate (signal price)
+            sl_price=pos.sl_price,
+            sl_order_id=None,
+            tp_price=pos.tp_price,
+            tp_order_id=None,
+        )
+    await notify(
+        f"🔧 *{pos.symbol}* PENDING entry diadopsi dari Binance (qty=`{real_qty}`). SL/TP perlu dicek manual."
+    )
