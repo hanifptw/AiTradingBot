@@ -35,7 +35,7 @@ class AppConfig(BaseSettings):
     openrouter_decision_model: str = "x-ai/grok-4.20"
 
     # Trading universe — fixed list of perpetual symbols on Binance Futures USDT-M.
-    universe_symbols: list[str] = Field(default_factory=lambda: ["BTCUSDT", "HYPEUSDT", "ZECUSDT"])
+    universe_symbols: list[str] = Field(default_factory=lambda: ["NEARUSDT", "HYPEUSDT", "ZECUSDT"])
     # Bars of 1h OHLCV sent to the LLM per coin in the portfolio call.
     ohlcv_history_bars: int = 100
     # Interval (minutes) between exit-monitor polls for open positions.
@@ -62,7 +62,7 @@ class AppConfig(BaseSettings):
     @classmethod
     def _parse_symbols(cls, v: object) -> list[str]:
         if v in (None, ""):
-            return ["BTCUSDT", "HYPEUSDT", "ZECUSDT"]
+            return ["NEARUSDT", "HYPEUSDT", "ZECUSDT"]
         if isinstance(v, str):
             return [x.strip().upper() for x in v.split(",") if x.strip()]
         if isinstance(v, list):

@@ -17,7 +17,7 @@ _SECRETS = dict(
 
 def test_universe_default():
     cfg = AppConfig(**_SECRETS)
-    assert cfg.universe_symbols == ["BTCUSDT", "HYPEUSDT", "ZECUSDT"]
+    assert cfg.universe_symbols == ["NEARUSDT", "HYPEUSDT", "ZECUSDT"]
     assert cfg.openrouter_decision_model == "x-ai/grok-4.20"
     assert cfg.ohlcv_history_bars == 100
     assert cfg.exit_poll_minutes == 15
