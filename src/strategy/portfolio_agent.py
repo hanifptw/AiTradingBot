@@ -39,12 +39,70 @@ _bar_cycle_lock = asyncio.Lock()
 _exit_cycle_lock = asyncio.Lock()
 
 
-def _position_view(pos: Position, mark_price: Decimal | None) -> dict:
-    """Compact JSON-able snapshot for prompts."""
+def _prev_close_from_ohlcv(df: pd.DataFrame | None) -> Decimal | None:
+    """Most recently closed 1h bar's close, used as the "1h ago" snapshot.
+
+    The OHLCV passed to prompts has the in-progress bar already dropped, so
+    `iloc[-1]` is the most recently completed bar — close-price roughly an
+    hour behind the current mark_price.
+    """
+    if df is None or df.empty:
+        return None
+    try:
+        return Decimal(str(df.iloc[-1]["close"]))
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _position_view(
+    pos: Position,
+    mark_price: Decimal | None,
+    prev_close: Decimal | None = None,
+) -> dict:
+    """Compact JSON-able snapshot for prompts.
+
+    `prev_close` is the close price of the bar immediately preceding the current
+    one — used to compute `dist_to_sl_pct_1h_ago` / `dist_to_tp_pct_1h_ago` so
+    the LLM can evaluate "SL distance shrinking" without re-deriving from OHLCV.
+    """
     direction = Decimal("1") if pos.side == Side.LONG.value else Decimal("-1")
-    upnl_pct = Decimal("0")
+    upnl_pct: Decimal | None = None
     if mark_price is not None and pos.entry_price > 0:
         upnl_pct = (mark_price - pos.entry_price) / pos.entry_price * Decimal("100") * direction
+
+    # live_R is anchored to the original SL distance — gives the LLM a unit
+    # consistent with the R-multiple in the historical context block.
+    sl_distance_pct: Decimal | None = None
+    if pos.sl_price and pos.entry_price > 0:
+        sl_distance_pct = abs(pos.entry_price - pos.sl_price) / pos.entry_price * Decimal("100")
+        if sl_distance_pct == 0:
+            sl_distance_pct = None
+    live_r: Decimal | None = None
+    if upnl_pct is not None and sl_distance_pct:
+        live_r = upnl_pct / sl_distance_pct
+
+    def _dist_to(target: Decimal, ref_price: Decimal) -> Decimal:
+        # Percent move from ref_price to `target` in the favorable direction
+        # (positive = still need that much further; negative = already past).
+        return (target - ref_price) / ref_price * Decimal("100") * direction
+
+    dist_to_tp_pct: Decimal | None = None
+    dist_to_sl_pct: Decimal | None = None
+    if mark_price is not None:
+        if pos.tp_price:
+            dist_to_tp_pct = _dist_to(pos.tp_price, mark_price)
+        if pos.sl_price:
+            # For SL the "favorable" direction is away from SL, so flip sign:
+            # positive = buffer remaining; negative = already breached.
+            dist_to_sl_pct = -_dist_to(pos.sl_price, mark_price)
+
+    dist_to_tp_pct_1h_ago: Decimal | None = None
+    dist_to_sl_pct_1h_ago: Decimal | None = None
+    if prev_close is not None:
+        if pos.tp_price:
+            dist_to_tp_pct_1h_ago = _dist_to(pos.tp_price, prev_close)
+        if pos.sl_price:
+            dist_to_sl_pct_1h_ago = -_dist_to(pos.sl_price, prev_close)
 
     # Bars open on the 1h timeframe. opened_at is stored as tz-aware UTC.
     now = datetime.now(UTC)
@@ -62,7 +120,16 @@ def _position_view(pos: Position, mark_price: Decimal | None) -> dict:
         "sl_price": f"{float(pos.sl_price):.6g}" if pos.sl_price else "n/a",
         "tp_price": f"{float(pos.tp_price):.6g}" if pos.tp_price else "n/a",
         "leverage": pos.leverage,
-        "upnl_pct": float(upnl_pct),
+        "upnl_pct": float(upnl_pct) if upnl_pct is not None else None,
+        "live_r": float(live_r) if live_r is not None else None,
+        "dist_to_tp_pct": float(dist_to_tp_pct) if dist_to_tp_pct is not None else None,
+        "dist_to_sl_pct": float(dist_to_sl_pct) if dist_to_sl_pct is not None else None,
+        "dist_to_tp_pct_1h_ago": (
+            float(dist_to_tp_pct_1h_ago) if dist_to_tp_pct_1h_ago is not None else None
+        ),
+        "dist_to_sl_pct_1h_ago": (
+            float(dist_to_sl_pct_1h_ago) if dist_to_sl_pct_1h_ago is not None else None
+        ),
         "bars_open": bars_open,
     }
 
@@ -204,7 +271,14 @@ async def _run_bar_close_cycle_locked() -> None:
         except Exception:
             log.exception("mark_price failed for %s", pos.symbol)
 
-    pos_views = [_position_view(p, mark_prices.get(p.symbol)) for p in open_positions_db]
+    pos_views = [
+        _position_view(
+            p,
+            mark_prices.get(p.symbol),
+            prev_close=_prev_close_from_ohlcv(universe_ohlcv.get(p.symbol)),
+        )
+        for p in open_positions_db
+    ]
 
     decision, raw_response = await portfolio_decision.decide_portfolio(
         universe_ohlcv=universe_ohlcv,
@@ -568,7 +642,14 @@ async def _run_exit_poll_cycle_locked() -> None:
         except Exception:
             log.exception("klines failed for %s", sym)
 
-    pos_views = [_position_view(p, latest_prices.get(p.symbol)) for p in open_positions_db]
+    pos_views = [
+        _position_view(
+            p,
+            latest_prices.get(p.symbol),
+            prev_close=_prev_close_from_ohlcv(recent_ohlcv.get(p.symbol)),
+        )
+        for p in open_positions_db
+    ]
 
     decision, raw_response = await exit_monitor.evaluate_open_positions(
         open_positions=pos_views,

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from src.ai.prompts import format_historical_context
+from src.ai.prompts import (
+    EXIT_MONITOR_SYSTEM,
+    PORTFOLIO_TRADER_SYSTEM,
+    _format_position,
+    format_historical_context,
+)
 
 
 def _full_stats(**overrides) -> dict:
@@ -181,3 +186,72 @@ def test_handles_none_avg_r_in_stats():
     assert out is not None
     assert "avg_R: n/a" in out
     assert "best_R" not in out
+
+
+# --- _format_position rendering ---------------------------------------------
+
+
+def _pos_view(**overrides) -> dict:
+    base = {
+        "id": 12,
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "qty": "0.01",
+        "entry_price": "100",
+        "sl_price": "95",
+        "tp_price": "110",
+        "leverage": 5,
+        "upnl_pct": 3.0,
+        "live_r": 0.6,
+        "dist_to_tp_pct": 6.79,
+        "dist_to_sl_pct": 7.77,
+        "dist_to_tp_pct_1h_ago": 8.91,
+        "dist_to_sl_pct_1h_ago": 5.94,
+        "bars_open": 3,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_format_position_shows_live_r_and_distances() -> None:
+    out = _format_position(_pos_view())
+    assert "live_R=+0.60" in out
+    assert "dist_to_tp=+6.79%" in out
+    assert "dist_to_sl=+7.77%" in out
+    assert "prev=+5.94%" in out
+    assert "prev=+8.91%" in out
+
+
+def test_format_position_handles_null_fields() -> None:
+    out = _format_position(
+        _pos_view(
+            live_r=None,
+            dist_to_tp_pct=None,
+            dist_to_sl_pct=None,
+            dist_to_tp_pct_1h_ago=None,
+            dist_to_sl_pct_1h_ago=None,
+            upnl_pct=None,
+        )
+    )
+    assert "live_R=n/a" in out
+    assert "dist_to_tp=n/a" in out
+    assert "dist_to_sl=n/a" in out
+    assert "prev=n/a" in out
+
+
+# --- prompt snapshot doctrine -----------------------------------------------
+
+
+def test_portfolio_prompt_contains_new_doctrine() -> None:
+    assert "Closing winners" in PORTFOLIO_TRADER_SYSTEM
+    assert "Closing invalidated losers" in PORTFOLIO_TRADER_SYSTEM
+    assert "live_R" in PORTFOLIO_TRADER_SYSTEM
+    assert "live_R is null" in PORTFOLIO_TRADER_SYSTEM
+    assert "SL placement" in PORTFOLIO_TRADER_SYSTEM
+    assert "1.5× the average 1h bar true range" in PORTFOLIO_TRADER_SYSTEM
+
+
+def test_exit_monitor_prompt_contains_new_doctrine() -> None:
+    assert "HARD trigger" in EXIT_MONITOR_SYSTEM
+    assert "invalidated losing position" in EXIT_MONITOR_SYSTEM
+    assert "live_R is null" in EXIT_MONITOR_SYSTEM

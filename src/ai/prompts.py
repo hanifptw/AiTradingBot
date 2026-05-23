@@ -45,9 +45,35 @@ For CLOSE and HOLD, size/leverage/sl/tp may be null; confidence + reasoning stil
 Trade hygiene:
 - Be selective. HOLD is acceptable — and expected — for most symbols on most bars.
 - Never propose an OPEN on a symbol that already has an open position; CLOSE first if you want to flip.
-- SL must sit on the loss side of the entry; TP on the profit side. Target R:R >= 1.5 when possible.
+- TP must sit on the profit side. Target R:R >= 1.5 when possible.
 - Respect the trend: don't fight a clean impulsive structure unless there is a high-conviction reversal signal.
 - If unsure, HOLD.
+
+SL placement (this matters as much as the entry — a tight SL forces you to babysit and over-close):
+- Place SL just BEYOND the most relevant structural level on the 1h, with a buffer for noise:
+  * for LONG: below the prior swing low / demand zone, NOT just below entry as a round %,
+  * for SHORT: above the prior swing high / supply zone, mirror.
+- Minimum SL distance: at least 1.5× the average 1h bar true range over the last 12-20 bars. Estimate from the OHLCV provided — typical 1h true range = mean of (high-low) across the lookback. If your candidate SL is closer than 1.5× that, widen it.
+- Cap: if a structural SL would force per-trade risk above the implied 1R loss budget (max_equity_per_trade_pct × leverage), REDUCE size_pct_equity rather than tighten SL.
+- Rationale: a SL at 1.5-2.5× noise lets the position breathe through normal pullbacks. A SL at 0.5-1× noise sits inside the bar range — it will either get hit by random noise or force you to CLOSE prematurely to avoid the hit. Both destroy edge.
+- If you cannot find a structural SL level (chop / no clean swing), HOLD instead of opening at all.
+
+Closing winners (when an open position is currently in profit):
+- DO NOT close a winning position just because momentum slowed, a single bar pulled back, or volume thinned. That is the normal path to TP — closing here trades a known partial profit for a guessed reversal and is the single biggest source of lost edge.
+- Only CLOSE a profitable position when at least one of these is present:
+  (a) clean structural break against the position (lower-low for longs, higher-high for shorts on the 1h),
+  (b) live_R already >= 1.0 AND a strong reversal candle/pattern is printing,
+  (c) dist_to_sl_pct is shrinking vs dist_to_sl_pct_1h_ago while dist_to_tp_pct is not improving (price drifting toward SL, not TP).
+- If live_R is between 0 and 1.0 and none of (a)/(b)/(c) hold, HOLD. The TP order on Binance will close at target.
+- Fallback when live_R is null (no SL set): treat upnl_pct >= 2.0% as the rough "1R" threshold; the same trigger logic applies but in upnl_pct terms, and you must require a HARD reversal pattern in addition (not just a pullback bar).
+
+Closing invalidated losers (symmetric — DO close decisively when the thesis is broken):
+- A loser whose original entry trigger is invalidated should be CLOSEd BEFORE the SL hits — sitting on a clearly broken thesis just to honour the original SL wastes the difference.
+- Concretely CLOSE a losing position when at least one of these is present:
+  (d) live_R <= -0.5 AND counter-trend confirmation on the 1h (e.g. for a LONG: lower-high then lower-low printed since entry, OR 1h close back below the entry trigger level),
+  (e) dist_to_sl_pct <= ~0.5% AND no bounce structure (closing here avoids slippage vs SL fill),
+  (f) live_R null fallback: upnl_pct <= -1.0% AND counter-trend confirmation.
+- Do NOT pre-emptively close a losing position still inside its normal noise band (live_R between -0.5 and 0) without (d)/(e)/(f) — that is just stop-shrinking and gives back edge to noise.
 
 If a `## Historical context` section is present, treat it as ground truth about your past behavior. AVOID re-opening setups that match patterns from the worst-trades list (same symbol + same side + similar structure). When a symbol shows negative cumulative R over 7d, raise the bar for new entries on it. The evaluator report flags systemic issues — incorporate its diagnosis. Do NOT cite the historical block verbatim in `reasoning`; use it to inform conviction and selection.
 
@@ -72,13 +98,28 @@ Output STRICT JSON ONLY (no prose, no markdown fences) matching this schema:
 
 EXIT_MONITOR_SYSTEM = """You re-evaluate OPEN crypto-futures positions between 1h bar closes.
 
-You see ONLY: each open position (entry, side, size, unrealized PnL, age) and a short OHLCV tail per symbol.
+You see ONLY: each open position (entry, side, size, live_R, dist_to_tp/sl, age) and a short OHLCV tail per symbol.
 
 For each open position output one of:
 - CLOSE — close immediately (market reduce-only) because structure flipped, momentum is clearly against the position, or a strong reversal is forming after meaningful profit.
 - HOLD  — keep the position; SL and TP placed on Binance will take care of normal exits.
 
 You CANNOT open new positions here. Be conservative — exiting too early eats edge. When in doubt, HOLD.
+
+CLOSE a profitable position (upnl_pct > 0) only with a HARD trigger:
+- 1h structure has flipped (for LONG: latest close < previous swing low; for SHORT: latest close > previous swing high),
+- OR live_R >= 1.0 AND a strong reversal pattern is forming on the current bar,
+- OR dist_to_sl_pct is shrinking vs dist_to_sl_pct_1h_ago while dist_to_tp_pct is not improving (price drifting toward SL, not TP).
+- Fallback when live_R is null (no SL set): same triggers but use upnl_pct >= 2.0% as the rough "1R" reference, and require a HARD reversal pattern.
+
+If none of those, HOLD. The TP and SL orders on Binance handle normal exits — your job is to react to genuine regime change between bars, not to nibble profit on every dip.
+
+CLOSE an invalidated losing position when at least one of these is present:
+- live_R <= -0.5 AND counter-trend confirmation on the 1h (lower-high then lower-low for LONG; mirror for SHORT),
+- OR dist_to_sl_pct <= ~0.5% AND no bounce structure (avoids slippage vs SL fill),
+- OR live_R null fallback: upnl_pct <= -1.0% AND counter-trend confirmation.
+
+Do NOT pre-emptively close a losing position still inside normal noise (live_R between -0.5 and 0) without the above — that is just stop-shrinking.
 
 If a `## Historical context` section is present, use it to recognize losing patterns earlier (e.g. a symbol with 7d negative R drifting against you may warrant a CLOSE sooner than usual).
 
@@ -128,12 +169,28 @@ def _ohlcv_rows(df: pd.DataFrame, n: int) -> str:
     return "\n".join(lines)
 
 
+def _fmt_pct(v: float | None) -> str:
+    return f"{v:+.2f}%" if v is not None else "n/a"
+
+
+def _fmt_r(v: float | None) -> str:
+    return f"{v:+.2f}" if v is not None else "n/a"
+
+
 def _format_position(p: dict) -> str:
+    upnl = _fmt_pct(p.get("upnl_pct"))
+    live_r = _fmt_r(p.get("live_r"))
+    dtp = _fmt_pct(p.get("dist_to_tp_pct"))
+    dsl = _fmt_pct(p.get("dist_to_sl_pct"))
+    dtp_prev = _fmt_pct(p.get("dist_to_tp_pct_1h_ago"))
+    dsl_prev = _fmt_pct(p.get("dist_to_sl_pct_1h_ago"))
     return (
         f"  - id={p['id']} {p['symbol']} {p['side']} qty={p['qty']} "
         f"entry={p['entry_price']} lev={p['leverage']}x "
         f"sl={p.get('sl_price', 'n/a')} tp={p.get('tp_price', 'n/a')} "
-        f"upnl_pct={p['upnl_pct']:+.2f}% bars_open={p['bars_open']}"
+        f"upnl_pct={upnl} live_R={live_r} "
+        f"dist_to_tp={dtp}(prev={dtp_prev}) dist_to_sl={dsl}(prev={dsl_prev}) "
+        f"bars_open={p['bars_open']}"
     )
 
 
